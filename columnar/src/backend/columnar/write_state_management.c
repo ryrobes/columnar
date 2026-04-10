@@ -197,9 +197,9 @@ columnar_init_write_state(Relation relation, TupleDesc tupdesc,
 
 	SubXidWriteState *stackEntry = palloc0(sizeof(SubXidWriteState));
 #if PG_VERSION_NUM >= PG_VERSION_16
-	stackEntry->writeState = ColumnarBeginWrite(relation->rd_locator,
+	stackEntry->writeState = ColumnarBeginWrite(relation,
 #else
-	stackEntry->writeState = ColumnarBeginWrite(relation->rd_node,
+	stackEntry->writeState = ColumnarBeginWrite(relation,
 #endif
 
 												columnarOptions,

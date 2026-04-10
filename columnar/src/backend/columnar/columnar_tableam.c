@@ -670,10 +670,10 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *sscan,
 		if (scan->is_select_query)
 #if PG_VERSION_NUM >= PG_VERSION_16
 			scan->stripeMetadataList =
-				StripesForRelfilenode(columnarRelation->rd_locator, ForwardScanDirection);
+				StripesForRelation(columnarRelation, ForwardScanDirection);
 #else
 			scan->stripeMetadataList =
-				StripesForRelfilenode(columnarRelation->rd_node, ForwardScanDirection);
+				StripesForRelation(columnarRelation, ForwardScanDirection);
 #endif
 
 	}
@@ -868,48 +868,62 @@ static TransactionId
 columnar_index_delete_tuples(Relation rel,
 							 TM_IndexDeleteOp *delstate)
 {
-	previousCacheEnabledState = columnar_enable_page_cache;
+	TransactionId result = InvalidTransactionId;
+	bool old_cache_mode = columnar_enable_page_cache;
+
 	columnar_enable_page_cache = false;
 
-	/*
-	 * XXX: We didn't bother implementing index_delete_tuple for neither of
-	 * simple deletion and bottom-up deletion cases. There is no particular
-	 * reason for that, just to keep things simple.
-	 *
-	 * See the rest of this function to see how we deal with
-	 * index_delete_tuples requests made to columnarAM.
-	 */
+	PG_TRY();
+	{
+		/*
+		 * XXX: We didn't bother implementing index_delete_tuple for neither of
+		 * simple deletion and bottom-up deletion cases. There is no particular
+		 * reason for that, just to keep things simple.
+		 *
+		 * See the rest of this function to see how we deal with
+		 * index_delete_tuples requests made to columnarAM.
+		 */
 
-	if (delstate->bottomup)
-	{
-		/*
-		 * Ignore any bottom-up deletion requests.
-		 *
-		 * Currently only caller in postgres that does bottom-up deletion is
-		 * _bt_bottomupdel_pass, which in turn calls _bt_delitems_delete_check.
-		 * And this function is okay with ndeltids being set to 0 by tableAM
-		 * for bottom-up deletion.
-		 */
-		delstate->ndeltids = 0;
-		return InvalidTransactionId;
+		if (delstate->bottomup)
+		{
+			/*
+			 * Ignore any bottom-up deletion requests.
+			 *
+			 * Currently only caller in postgres that does bottom-up deletion is
+			 * _bt_bottomupdel_pass, which in turn calls _bt_delitems_delete_check.
+			 * And this function is okay with ndeltids being set to 0 by tableAM
+			 * for bottom-up deletion.
+			 */
+			delstate->ndeltids = 0;
+			result = InvalidTransactionId;
+		}
+		else
+		{
+			/*
+			 * TableAM is not expected to set ndeltids to 0 for simple deletion
+			 * case, so here we cannot do the same trick that we do for
+			 * bottom-up deletion.
+			 * See the assertion around table_index_delete_tuples call in pg
+			 * function index_compute_xid_horizon_for_tuples.
+			 *
+			 * For this reason, to avoid receiving simple deletion requests for
+			 * columnar tables (bottomup = false), columnar_index_fetch_tuple
+			 * doesn't ever set all_dead to true in order to prevent triggering
+			 * simple deletion of index tuples. But let's throw an error to be on
+			 * the safe side.
+			 */
+			elog(ERROR, "columnar_index_delete_tuples not implemented for simple deletion");
+		}
 	}
-	else
+	PG_CATCH();
 	{
-		/*
-		 * TableAM is not expected to set ndeltids to 0 for simple deletion
-		 * case, so here we cannot do the same trick that we do for
-		 * bottom-up deletion.
-		 * See the assertion around table_index_delete_tuples call in pg
-		 * function index_compute_xid_horizon_for_tuples.
-		 *
-		 * For this reason, to avoid receiving simple deletion requests for
-		 * columnar tables (bottomup = false), columnar_index_fetch_tuple
-		 * doesn't ever set all_dead to true in order to prevent triggering
-		 * simple deletion of index tuples. But let's throw an error to be on
-		 * the safe side.
-		 */
-		elog(ERROR, "columnar_index_delete_tuples not implemented for simple deletion");
+		columnar_enable_page_cache = old_cache_mode;
+		PG_RE_THROW();
 	}
+	PG_END_TRY();
+
+	columnar_enable_page_cache = old_cache_mode;
+	return result;
 }
 
 
@@ -930,34 +944,46 @@ static void
 columnar_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 					  int options, BulkInsertState bistate)
 {
-	previousCacheEnabledState = columnar_enable_page_cache;
+	bool old_cache_mode = columnar_enable_page_cache;
+
 	columnar_enable_page_cache = false;
 
-	/*
-	 * columnar_init_write_state allocates the write state in a longer
-	 * lasting context, so no need to worry about it.
-	 */
-	ColumnarWriteState *writeState = columnar_init_write_state(relation,
-															   RelationGetDescr(relation),
-																 slot->tts_tableOid,
-															   GetCurrentSubTransactionId());
-	MemoryContext oldContext = MemoryContextSwitchTo(ColumnarWritePerTupleContext(
-														 writeState));
+	PG_TRY();
+	{
+		/*
+		 * columnar_init_write_state allocates the write state in a longer
+		 * lasting context, so no need to worry about it.
+		 */
+		ColumnarWriteState *writeState = columnar_init_write_state(relation,
+																   RelationGetDescr(relation),
+																	 slot->tts_tableOid,
+																   GetCurrentSubTransactionId());
+		MemoryContext oldContext = MemoryContextSwitchTo(ColumnarWritePerTupleContext(
+															 writeState));
 
-	ColumnarCheckLogicalReplication(relation);
+		ColumnarCheckLogicalReplication(relation);
 
-	slot_getallattrs(slot);
+		slot_getallattrs(slot);
 
-	Datum *values = detoast_values(slot->tts_tupleDescriptor,
-								   slot->tts_values, slot->tts_isnull);
+		Datum *values = detoast_values(slot->tts_tupleDescriptor,
+									   slot->tts_values, slot->tts_isnull);
 
-	uint64 writtenRowNumber = ColumnarWriteRow(writeState, values, slot->tts_isnull);
-	slot->tts_tid = row_number_to_tid(writtenRowNumber);
+		uint64 writtenRowNumber = ColumnarWriteRow(writeState, values, slot->tts_isnull);
+		slot->tts_tid = row_number_to_tid(writtenRowNumber);
 
-	MemoryContextSwitchTo(oldContext);
-	MemoryContextReset(ColumnarWritePerTupleContext(writeState));
+		MemoryContextSwitchTo(oldContext);
+		MemoryContextReset(ColumnarWritePerTupleContext(writeState));
 
-	pgstat_count_heap_insert(relation, 1);
+		pgstat_count_heap_insert(relation, 1);
+	}
+	PG_CATCH();
+	{
+		columnar_enable_page_cache = old_cache_mode;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	columnar_enable_page_cache = old_cache_mode;
 }
 
 
@@ -966,44 +992,51 @@ columnar_tuple_insert_speculative(Relation relation, TupleTableSlot *slot,
 								  CommandId cid, int options,
 								  BulkInsertState bistate, uint32 specToken)
 {
-	previousCacheEnabledState = columnar_enable_page_cache;
+	bool old_cache_mode = columnar_enable_page_cache;
+
+	previousCacheEnabledState = old_cache_mode;
 	columnar_enable_page_cache = false;
 
-	/*
-	 * columnar_init_write_state allocates the write state in a longer
-	 * lasting context, so no need to worry about it.
-	 */
-	ColumnarWriteState *writeState = columnar_init_write_state(relation,
-															   RelationGetDescr(relation),
-																 slot->tts_tableOid,
-															   GetCurrentSubTransactionId());
-	MemoryContext oldContext = MemoryContextSwitchTo(ColumnarWritePerTupleContext(
-														 writeState));
+	PG_TRY();
+	{
+		/*
+		 * columnar_init_write_state allocates the write state in a longer
+		 * lasting context, so no need to worry about it.
+		 */
+		ColumnarWriteState *writeState = columnar_init_write_state(relation,
+																   RelationGetDescr(relation),
+																	 slot->tts_tableOid,
+																   GetCurrentSubTransactionId());
+		MemoryContext oldContext = MemoryContextSwitchTo(ColumnarWritePerTupleContext(
+															 writeState));
 
-	ColumnarCheckLogicalReplication(relation);
+		ColumnarCheckLogicalReplication(relation);
 
-	slot_getallattrs(slot);
+		slot_getallattrs(slot);
 
-	Datum *values = detoast_values(slot->tts_tupleDescriptor,
-								   slot->tts_values, slot->tts_isnull);
+		Datum *values = detoast_values(slot->tts_tupleDescriptor,
+									   slot->tts_values, slot->tts_isnull);
 
+		uint64 storageId = LookupStorageIdByRelation(relation);
+		uint64 writtenRowNumber = ColumnarWriteRow(writeState, values, slot->tts_isnull);
 #if PG_VERSION_NUM >= PG_VERSION_16
-	uint64 storageId = LookupStorageId(relation->rd_locator);
+		UpdateRowMask(relation->rd_locator, storageId,  NULL, writtenRowNumber);
 #else
-	uint64 storageId = LookupStorageId(relation->rd_node);
+		UpdateRowMask(relation->rd_node, storageId,  NULL, writtenRowNumber);
 #endif
-	uint64 writtenRowNumber = ColumnarWriteRow(writeState, values, slot->tts_isnull);
-#if PG_VERSION_NUM >= PG_VERSION_16
-	UpdateRowMask(relation->rd_locator, storageId,  NULL, writtenRowNumber);
-#else
-	UpdateRowMask(relation->rd_node, storageId,  NULL, writtenRowNumber);
-#endif
-	slot->tts_tid = row_number_to_tid(writtenRowNumber);
+		slot->tts_tid = row_number_to_tid(writtenRowNumber);
 
-	MemoryContextSwitchTo(oldContext);
-	MemoryContextReset(ColumnarWritePerTupleContext(writeState));
+		MemoryContextSwitchTo(oldContext);
+		MemoryContextReset(ColumnarWritePerTupleContext(writeState));
 
-	pgstat_count_heap_insert(relation, 1);
+		pgstat_count_heap_insert(relation, 1);
+	}
+	PG_CATCH();
+	{
+		columnar_enable_page_cache = old_cache_mode;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 
@@ -1011,11 +1044,7 @@ static void
 columnar_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
 									uint32 specToken, bool succeeded)
 {
-#if PG_VERSION_NUM >= PG_VERSION_16
-	uint64 storageId = LookupStorageId(relation->rd_locator);
-#else
-	uint64 storageId = LookupStorageId(relation->rd_node);
-#endif
+	uint64 storageId = LookupStorageIdByRelation(relation);
 	/* Set lock for relation until transaction ends */
 	DirectFunctionCall1(pg_advisory_xact_lock_int8,
 						Int64GetDatum((int64) storageId));
@@ -1031,15 +1060,46 @@ columnar_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 															   RelationGetDescr(relation),
 																 slots[0]->tts_tableOid,
 															   GetCurrentSubTransactionId());
+	EState *estate = NULL;
+	ResultRelInfo *resultRelInfo = NULL;
+	MemoryContext executorContext = NULL;
+	bool openedIndices = false;
+	bool needsModifyState = relation->rd_att->constr != NULL ||
+							relation->rd_rel->relhasindex;
 
 	ColumnarCheckLogicalReplication(relation);
 
-	MemoryContext oldContext = MemoryContextSwitchTo(ColumnarWritePerTupleContext(
-														 writeState));
+	if (needsModifyState)
+	{
+		MemoryContext oldContext = CurrentMemoryContext;
+		executorContext = AllocSetContextCreate(CurrentMemoryContext,
+												"Columnar Multi Insert Executor Context",
+												ALLOCSET_DEFAULT_SIZES);
+		MemoryContextSwitchTo(executorContext);
+
+		estate = create_estate_for_relation(relation);
+
+#if PG_VERSION_NUM >= PG_VERSION_14
+		resultRelInfo = makeNode(ResultRelInfo);
+		InitResultRelInfo(resultRelInfo, relation, 1, NULL, 0);
+#else
+		resultRelInfo = estate->es_result_relation_info;
+#endif
+
+		if (relation->rd_rel->relhasindex)
+		{
+			ExecOpenIndices(resultRelInfo, false);
+			openedIndices = true;
+		}
+
+		MemoryContextSwitchTo(oldContext);
+	}
 
 	for (int i = 0; i < ntuples; i++)
 	{
 		TupleTableSlot *tupleSlot = slots[i];
+		MemoryContext oldContext =
+			MemoryContextSwitchTo(ColumnarWritePerTupleContext(writeState));
 
 		slot_getallattrs(tupleSlot);
 
@@ -1048,22 +1108,23 @@ columnar_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 		uint64 writtenRowNumber = ColumnarWriteRow(writeState, values,
 												   tupleSlot->tts_isnull);
+		tupleSlot->tts_tid = row_number_to_tid(writtenRowNumber);
 
-		EState *estate = create_estate_for_relation(relation);
+		MemoryContextSwitchTo(oldContext);
 
-#if PG_VERSION_NUM >= PG_VERSION_14
-		ResultRelInfo *resultRelInfo = makeNode(ResultRelInfo);
-		InitResultRelInfo(resultRelInfo, relation, 1, NULL, 0);
-#else
-		ResultRelInfo *resultRelInfo = estate->es_result_relation_info;
-#endif
-
-		ExecOpenIndices(resultRelInfo, false);
-
-		if (relation->rd_att->constr)
+		if (resultRelInfo != NULL && relation->rd_att->constr)
+		{
+			ResetPerTupleExprContext(estate);
 			ExecConstraints(resultRelInfo, tupleSlot, estate);
+		}
 
-		ExecCloseIndices(resultRelInfo);
+		MemoryContextResetAndDeleteChildren(ColumnarWritePerTupleContext(writeState));
+	}
+
+	if (estate != NULL)
+	{
+		if (openedIndices)
+			ExecCloseIndices(resultRelInfo);
 
 		AfterTriggerEndQuery(estate);
 #if PG_VERSION_NUM >= PG_VERSION_14
@@ -1074,13 +1135,8 @@ columnar_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 #endif
 		ExecResetTupleTable(estate->es_tupleTable, false);
 		FreeExecutorState(estate);
-
-		tupleSlot->tts_tid = row_number_to_tid(writtenRowNumber);
-
-		MemoryContextResetAndDeleteChildren(ColumnarWritePerTupleContext(writeState));
+		MemoryContextDelete(executorContext);
 	}
-
-	MemoryContextSwitchTo(oldContext);
 
 	pgstat_count_heap_insert(relation, ntuples);
 }
@@ -1092,11 +1148,7 @@ columnar_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 					  TM_FailureData *tmfd, bool changingPart)
 {
 	uint64 rowNumber = tid_to_row_number(*tid);
-#if PG_VERSION_NUM >= PG_VERSION_16
-	uint64 storageId = LookupStorageId(relation->rd_locator);
-#else
-	uint64 storageId = LookupStorageId(relation->rd_node);
-#endif
+	uint64 storageId = LookupStorageIdByRelation(relation);
 	/* Set lock for relation until transaction ends */
 	DirectFunctionCall1(pg_advisory_xact_lock_int8,
 						Int64GetDatum((int64) storageId));
@@ -1131,11 +1183,7 @@ columnar_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 
 	
 	uint64 rowNumber = tid_to_row_number(*otid);
-#if PG_VERSION_NUM >= PG_VERSION_16
-	uint64 storageId = LookupStorageId(relation->rd_locator);
-#else
-	uint64 storageId = LookupStorageId(relation->rd_node);
-#endif
+	uint64 storageId = LookupStorageIdByRelation(relation);
 
 	/* Set lock for relation until transaction ends */
 	DirectFunctionCall1(pg_advisory_xact_lock_int8,
@@ -1232,14 +1280,14 @@ columnar_relation_set_new_filenode(Relation rel,
 	{
 		MarkRelfilenodeDropped(rel->rd_locator.relNumber, GetCurrentSubTransactionId());
 
-		DeleteMetadataRows(rel->rd_locator);
+		DeleteMetadataRowsByRelation(rel);
 	}
 #else
 	if (rel->rd_node.relNode != newrnode->relNode)
 	{
 		MarkRelfilenodeDropped(rel->rd_node.relNode, GetCurrentSubTransactionId());
 
-		DeleteMetadataRows(rel->rd_node);
+		DeleteMetadataRowsByRelation(rel);
 	}
 #endif
 	*freezeXid = RecentXmin;
@@ -1272,7 +1320,7 @@ columnar_relation_nontransactional_truncate(Relation rel)
 	NonTransactionDropWriteState(relfilelocator.relNode);
 #endif
 	/* Delete old relfilelocator metadata */
-	DeleteMetadataRows(relfilelocator);
+	DeleteMetadataRowsByRelation(rel);
 
 	/*
 	 * No need to set new relfilelocator, since the table was created in this
@@ -1344,17 +1392,30 @@ columnar_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	ReadColumnarOptions(OldHeap->rd_id, &columnarOptions);
 
 #if PG_VERSION_NUM >= PG_VERSION_16
-	ColumnarWriteState *writeState = ColumnarBeginWrite(NewHeap->rd_locator,
+	ColumnarWriteState *writeState = ColumnarBeginWrite(NewHeap,
 														columnarOptions,
 														targetDesc);
 #else
-	ColumnarWriteState *writeState = ColumnarBeginWrite(NewHeap->rd_node,
+	ColumnarWriteState *writeState = ColumnarBeginWrite(NewHeap,
 														columnarOptions,
 														targetDesc);
 #endif
 	/* we need all columns */
 	int natts = OldHeap->rd_att->natts;
-	Bitmapset *attr_needed = bms_add_range(NULL, 0, natts - 1);
+	Bitmapset *attr_needed = NULL;
+	if (natts > 0)
+	{
+		attr_needed = bms_add_range(NULL, 0, natts - 1);
+	}
+	bool hasVisibleColumn = false;
+	for (int attno = 0; attno < sourceDesc->natts; attno++)
+	{
+		if (!TupleDescAttr(sourceDesc, attno)->attisdropped)
+		{
+			hasVisibleColumn = true;
+			break;
+		}
+	}
 
 	/* no quals for table rewrite */
 	List *scanQual = NIL;
@@ -1375,11 +1436,30 @@ columnar_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 
 	*num_tuples = 0;
 
-	/* we don't need to know rowNumber here */
-	while (ColumnarReadNextRow(readState, values, nulls, NULL))
+	/*
+	 * When every attribute is dropped, reading through the regular row
+	 * reader can duplicate rows during VACUUM FULL rewrites. Preserve only
+	 * the visible row count and rewrite all-dropped rows as NULLs instead.
+	 */
+	if (!hasVisibleColumn)
 	{
-		ColumnarWriteRow(writeState, values, nulls);
-		(*num_tuples)++;
+		uint64 rowCount = ColumnarTableRowCount(OldHeap);
+
+		memset(nulls, true, sizeof(bool) * sourceDesc->natts);
+		for (uint64 rowIndex = 0; rowIndex < rowCount; rowIndex++)
+		{
+			ColumnarWriteRow(writeState, values, nulls);
+			(*num_tuples)++;
+		}
+	}
+	else
+	{
+		/* we don't need to know rowNumber here */
+		while (ColumnarReadNextRow(readState, values, nulls, NULL))
+		{
+			ColumnarWriteRow(writeState, values, nulls);
+			(*num_tuples)++;
+		}
 	}
 
 	*tups_vacuumed = 0;
@@ -1445,9 +1525,9 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 
 	/* Get all stripes in reverse order */
 #if PG_VERSION_NUM >= PG_VERSION_16
-	List *stripeMetadataList = StripesForRelfilenode(rel->rd_locator, BackwardScanDirection);
+	List *stripeMetadataList = StripesForRelation(rel, BackwardScanDirection);
 #else
-	List *stripeMetadataList = StripesForRelfilenode(rel->rd_node, BackwardScanDirection);
+	List *stripeMetadataList = StripesForRelation(rel, BackwardScanDirection);
 #endif
 	/* Empty table nothing to do */
 	if (stripeMetadataList == NIL)
@@ -1468,15 +1548,15 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 	{
 		StripeMetadata * stripeMetadata = lfirst(lc);
 #if PG_VERSION_NUM >= PG_VERSION_16
-		lastStripeDeletedRows = DeletedRowsForStripe(rel->rd_locator,
-													 stripeMetadata->chunkCount,
-													 stripeMetadata->id);
+		lastStripeDeletedRows = DeletedRowsForStripeByRelation(rel,
+															   stripeMetadata->chunkCount,
+															   stripeMetadata->id);
 		totalDecompressedStripeLength += 
 			DecompressedLengthForStripe(rel->rd_locator, stripeMetadata->id);
 #else
-		lastStripeDeletedRows = DeletedRowsForStripe(rel->rd_node,
-													 stripeMetadata->chunkCount,
-													 stripeMetadata->id);
+		lastStripeDeletedRows = DeletedRowsForStripeByRelation(rel,
+															   stripeMetadata->chunkCount,
+															   stripeMetadata->id);
 		totalDecompressedStripeLength += 
 			DecompressedLengthForStripe(rel->rd_node, stripeMetadata->id);
 #endif
@@ -1549,11 +1629,11 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 	/* We need to re-assing RecentXmin here */
 	PushActiveSnapshot(GetTransactionSnapshot());
 #if PG_VERSION_NUM >= PG_VERSION_16
-	ColumnarWriteState *writeState = ColumnarBeginWrite(rel->rd_locator,
+	ColumnarWriteState *writeState = ColumnarBeginWrite(rel,
 														columnarOptions,
 														tupleDesc);
 #else
-	ColumnarWriteState *writeState = ColumnarBeginWrite(rel->rd_node,
+	ColumnarWriteState *writeState = ColumnarBeginWrite(rel,
 														columnarOptions,
 														tupleDesc);
 #endif
@@ -1608,9 +1688,9 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 	{
 		StripeMetadata *metadata = list_nth(stripeMetadataList, i);
 #if PG_VERSION_NUM >= PG_VERSION_16
-		DeleteMetadataRowsForStripeId(rel->rd_locator, metadata->id);
+		DeleteMetadataRowsForStripeIdByRelation(rel, metadata->id);
 #else
-		DeleteMetadataRowsForStripeId(rel->rd_node, metadata->id);
+		DeleteMetadataRowsForStripeIdByRelation(rel, metadata->id);
 #endif
 	}
 
@@ -1627,9 +1707,9 @@ static uint64
 ColumnarTableTupleCount(Relation relation)
 {
 #if PG_VERSION_NUM >= PG_VERSION_16
-	List *stripeList = StripesForRelfilenode(relation->rd_locator, ForwardScanDirection);
+	List *stripeList = StripesForRelation(relation, ForwardScanDirection);
 #else
-	List *stripeList = StripesForRelfilenode(relation->rd_node, ForwardScanDirection);
+	List *stripeList = StripesForRelation(relation, ForwardScanDirection);
 #endif
 	uint64 tupleCount = 0;
 
@@ -1796,11 +1876,6 @@ static void
 LogRelationStats(Relation rel, int elevel)
 {
 	ListCell *stripeMetadataCell = NULL;
-#if PG_VERSION_NUM >= PG_VERSION_16
-	RelFileLocator relfilelocator = rel->rd_locator;
-#else
-	RelFileLocator relfilelocator = rel->rd_node;
-#endif
 	StringInfo infoBuf = makeStringInfo();
 
 	int compressionStats[COMPRESSION_COUNT] = { 0 };
@@ -1811,7 +1886,7 @@ LogRelationStats(Relation rel, int elevel)
 	uint64 droppedChunksWithData = 0;
 	uint64 totalDecompressedLength = 0;
 
-	List *stripeList = StripesForRelfilenode(relfilelocator, ForwardScanDirection);
+	List *stripeList = StripesForRelation(rel, ForwardScanDirection);
 	int stripeCount = list_length(stripeList);
 
 	MemoryContext relation_stats_ctx =
@@ -1823,7 +1898,7 @@ LogRelationStats(Relation rel, int elevel)
 	foreach(stripeMetadataCell, stripeList)
 	{
 		StripeMetadata *stripe = lfirst(stripeMetadataCell);
-		StripeSkipList *skiplist = ReadStripeSkipList(relfilelocator, stripe->id,
+		StripeSkipList *skiplist = ReadStripeSkipListByRelation(rel, stripe->id,
 													  RelationGetDescr(rel),
 													  stripe->chunkCount,
 													  GetTransactionSnapshot());
@@ -2782,7 +2857,7 @@ ColumnarTableDropHook(Oid relid)
 #else
 		RelFileLocator relfilelocator = rel->rd_node;
 #endif
-		DeleteMetadataRows(relfilelocator);
+		DeleteMetadataRowsByRelation(rel);
 		DeleteColumnarTableOptions(rel->rd_id, true);
 #if PG_VERSION_NUM >= PG_VERSION_16
 		MarkRelfilenodeDropped(relfilelocator.relNumber, GetCurrentSubTransactionId());
@@ -3430,9 +3505,9 @@ static List *HolesForRelation(Relation rel)
 	ListCell *lc = NULL;
 
 #if PG_VERSION_NUM >= PG_VERSION_16
-	List *stripeMetadataList = StripesForRelfilenode(rel->rd_locator, ForwardScanDirection);
+	List *stripeMetadataList = StripesForRelation(rel, ForwardScanDirection);
 #else
-	List *stripeMetadataList = StripesForRelfilenode(rel->rd_node, ForwardScanDirection);
+	List *stripeMetadataList = StripesForRelation(rel, ForwardScanDirection);
 #endif
 	uint64 lastMinimalOffset = ColumnarFirstLogicalOffset;
 
@@ -3555,9 +3630,9 @@ vacuum_columnar_table(PG_FUNCTION_ARGS)
 
 	/* Get all stripes in order. */
 #if PG_VERSION_NUM >= PG_VERSION_16
-	List *stripeMetadataList = StripesForRelfilenode(rel->rd_locator, ForwardScanDirection);
+	List *stripeMetadataList = StripesForRelation(rel, ForwardScanDirection);
 #else
-	List *stripeMetadataList = StripesForRelfilenode(rel->rd_node, ForwardScanDirection);
+	List *stripeMetadataList = StripesForRelation(rel, ForwardScanDirection);
 #endif
 	List *vacuumCandidatesStripeList = NIL;
 
@@ -3598,13 +3673,13 @@ vacuum_columnar_table(PG_FUNCTION_ARGS)
 
 		StripeMetadata * stripeMetadata = lfirst(lc);
 #if PG_VERSION_NUM >= PG_VERSION_16
-		uint32 stripeDeletedRows = DeletedRowsForStripe(rel->rd_locator,
-												 		stripeMetadata->chunkCount,
-														stripeMetadata->id);
+		uint32 stripeDeletedRows = DeletedRowsForStripeByRelation(rel,
+												 				  stripeMetadata->chunkCount,
+																  stripeMetadata->id);
 #else
-		uint32 stripeDeletedRows = DeletedRowsForStripe(rel->rd_node,
-												 		stripeMetadata->chunkCount,
-														stripeMetadata->id);
+		uint32 stripeDeletedRows = DeletedRowsForStripeByRelation(rel,
+												 				  stripeMetadata->chunkCount,
+																  stripeMetadata->id);
 #endif
 		float percentageOfDeleteRows =
 			(float)stripeDeletedRows / (float)(stripeMetadata->rowCount);
@@ -3643,11 +3718,11 @@ vacuum_columnar_table(PG_FUNCTION_ARGS)
 	bool randomAccess = true;
 
 #if PG_VERSION_NUM >= PG_VERSION_16
-	ColumnarWriteState *writeState = ColumnarBeginWrite(rel->rd_locator,
+	ColumnarWriteState *writeState = ColumnarBeginWrite(rel,
 											columnarOptions,
 											tupleDesc);
 #else
-	ColumnarWriteState *writeState = ColumnarBeginWrite(rel->rd_node,
+	ColumnarWriteState *writeState = ColumnarBeginWrite(rel,
 											columnarOptions,
 											tupleDesc);
 #endif
@@ -3686,9 +3761,9 @@ vacuum_columnar_table(PG_FUNCTION_ARGS)
 		}
 
 #if PG_VERSION_NUM >= PG_VERSION_16
-		DeleteMetadataRowsForStripeId(rel->rd_locator, vacuumCandidate->stripeMetadata->id);
+		DeleteMetadataRowsForStripeIdByRelation(rel, vacuumCandidate->stripeMetadata->id);
 #else
-		DeleteMetadataRowsForStripeId(rel->rd_node, vacuumCandidate->stripeMetadata->id);
+		DeleteMetadataRowsForStripeIdByRelation(rel, vacuumCandidate->stripeMetadata->id);
 #endif
 		ColumnarEndRead(readState);
 
@@ -3834,9 +3909,9 @@ vacuum_columnar_table(PG_FUNCTION_ARGS)
 
 			/* Reload the metadata. */
 #if PG_VERSION_NUM >= PG_VERSION_16
-			stripeMetadataList = StripesForRelfilenode(rel->rd_locator, ForwardScanDirection);
+			stripeMetadataList = StripesForRelation(rel, ForwardScanDirection);
 #else
-			stripeMetadataList = StripesForRelfilenode(rel->rd_node, ForwardScanDirection);
+			stripeMetadataList = StripesForRelation(rel, ForwardScanDirection);
 #endif
 			foreach(stripeLc, stripeMetadataList)
 			{
@@ -3951,9 +4026,9 @@ columnar_stats(PG_FUNCTION_ARGS)
 
 		/* Retrieve the stripe metadata. */
 #if PG_VERSION_NUM >= PG_VERSION_16
-		List *stripeMetadataList = StripesForRelfilenode(rel->rd_locator, ForwardScanDirection);
+		List *stripeMetadataList = StripesForRelation(rel, ForwardScanDirection);
 #else
-		List *stripeMetadataList = StripesForRelfilenode(rel->rd_node, ForwardScanDirection);
+		List *stripeMetadataList = StripesForRelation(rel, ForwardScanDirection);
 #endif
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 				ereport(ERROR,
@@ -3979,13 +4054,13 @@ columnar_stats(PG_FUNCTION_ARGS)
 			stats[i].chunkCount = data->chunkCount;
 			stats[i].dataLength = data->dataLength;
 #if PG_VERSION_NUM >= PG_VERSION_16
-			stats[i].deletedRows = DeletedRowsForStripe(rel->rd_locator,
-												 		data->chunkCount,
-														data->id);
+			stats[i].deletedRows = DeletedRowsForStripeByRelation(rel,
+												 				  data->chunkCount,
+																  data->id);
 #else
-			stats[i].deletedRows = DeletedRowsForStripe(rel->rd_node,
-												 		data->chunkCount,
-														data->id);
+			stats[i].deletedRows = DeletedRowsForStripeByRelation(rel,
+												 				  data->chunkCount,
+																  data->id);
 #endif
 		}
 

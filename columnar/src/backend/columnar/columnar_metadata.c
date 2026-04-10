@@ -471,14 +471,12 @@ ReadColumnarOptions(Oid regclass, ColumnarOptions *options)
  * of columnar.chunk.
  */
 void
-SaveStripeSkipList(RelFileLocator relfilelocator, uint64 stripe, StripeSkipList *chunkList,
+SaveStripeSkipList(uint64 storageId, uint64 stripe, StripeSkipList *chunkList,
 				   TupleDesc tupleDescriptor)
 {
 	uint32 columnIndex = 0;
 	uint32 chunkIndex = 0;
 	uint32 columnCount = chunkList->columnCount;
-
-	uint64 storageId = LookupStorageId(relfilelocator);
 	Oid columnarChunkOid = ColumnarChunkRelationId();
 	Relation columnarChunk = table_open(columnarChunkOid, RowExclusiveLock);
 	ModifyState *modifyState = StartModifyRelation(columnarChunk);
@@ -537,10 +535,9 @@ SaveStripeSkipList(RelFileLocator relfilelocator, uint64 stripe, StripeSkipList 
  * SaveChunkGroups saves the metadata for given chunk groups in columnar.chunk_group.
  */
 void
-SaveChunkGroups(RelFileLocator relfilelocator, uint64 stripe,
+SaveChunkGroups(uint64 storageId, uint64 stripe,
 				List *chunkGroupRowCounts)
 {
-	uint64 storageId = LookupStorageId(relfilelocator);
 	Oid columnarChunkGroupOid = ColumnarChunkGroupRelationId();
 	Relation columnarChunkGroup = table_open(columnarChunkGroupOid, RowExclusiveLock);
 	ModifyState *modifyState = StartModifyRelation(columnarChunkGroup);
@@ -679,9 +676,9 @@ SaveEmptyRowMask(uint64 storageId, uint64 stripeId,
 /*
  * ReadStripeSkipList fetches chunk metadata for a given stripe.
  */
-StripeSkipList *
-ReadStripeSkipList(RelFileLocator relfilelocator, uint64 stripe, TupleDesc tupleDescriptor,
-				   uint32 chunkCount, Snapshot snapshot)
+static StripeSkipList *
+ReadStripeSkipListStorageId(uint64 storageId, uint64 stripe, TupleDesc tupleDescriptor,
+							uint32 chunkCount, Snapshot snapshot)
 {
 	int32 columnIndex = 0;
 	int32 chunkGroupIndex = 0;
@@ -689,8 +686,6 @@ ReadStripeSkipList(RelFileLocator relfilelocator, uint64 stripe, TupleDesc tuple
 	HeapTuple heapTuple = NULL;
 	uint32 columnCount = tupleDescriptor->natts;
 	ScanKeyData scanKey[2];
-
-	uint64 storageId = LookupStorageId(relfilelocator);
 
 	Oid columnarChunkOid = ColumnarChunkRelationId();
 	Relation columnarChunk = table_open(columnarChunkOid, AccessShareLock);
@@ -801,18 +796,34 @@ ReadStripeSkipList(RelFileLocator relfilelocator, uint64 stripe, TupleDesc tuple
 }
 
 
+StripeSkipList *
+ReadStripeSkipList(RelFileLocator relfilelocator, uint64 stripe, TupleDesc tupleDescriptor,
+				   uint32 chunkCount, Snapshot snapshot)
+{
+	return ReadStripeSkipListStorageId(LookupStorageId(relfilelocator), stripe,
+									   tupleDescriptor, chunkCount, snapshot);
+}
+
+
+StripeSkipList *
+ReadStripeSkipListByRelation(Relation relation, uint64 stripe, TupleDesc tupleDescriptor,
+							 uint32 chunkCount, Snapshot snapshot)
+{
+	return ReadStripeSkipListStorageId(LookupStorageIdByRelation(relation), stripe,
+									   tupleDescriptor, chunkCount, snapshot);
+}
+
+
 /*
  * ReadChunkRowMask fetches chunk row mask for columnar relation.
  */
-bytea *
-ReadChunkRowMask(RelFileLocator relfilelocator, Snapshot snapshot,
-				 MemoryContext cxt,
-				 uint64 stripeFirstRowNumber, int rowCount)
+static bytea *
+ReadChunkRowMaskStorageId(uint64 storageId, Snapshot snapshot,
+						  MemoryContext cxt,
+						  uint64 stripeFirstRowNumber, int rowCount)
 {
 	HeapTuple heapTuple = NULL;
 	ScanKeyData scanKey[3];
-
-	uint64 storageId = LookupStorageId(relfilelocator);
 
 	Oid columnarRowMaskOid = ColumnarRowMaskRelationId();
 	Relation columnarRowMask = table_open(columnarRowMaskOid, AccessShareLock);
@@ -863,6 +874,26 @@ ReadChunkRowMask(RelFileLocator relfilelocator, Snapshot snapshot,
 	table_close(columnarRowMask, AccessShareLock);
 
 	return chunkRowMaskBytea;
+}
+
+
+bytea *
+ReadChunkRowMask(RelFileLocator relfilelocator, Snapshot snapshot,
+				 MemoryContext cxt,
+				 uint64 stripeFirstRowNumber, int rowCount)
+{
+	return ReadChunkRowMaskStorageId(LookupStorageId(relfilelocator), snapshot,
+									 cxt, stripeFirstRowNumber, rowCount);
+}
+
+
+bytea *
+ReadChunkRowMaskByRelation(Relation relation, Snapshot snapshot,
+						   MemoryContext cxt,
+						   uint64 stripeFirstRowNumber, int rowCount)
+{
+	return ReadChunkRowMaskStorageId(LookupStorageIdByRelation(relation), snapshot,
+									 cxt, stripeFirstRowNumber, rowCount);
 }
 
 
@@ -1532,21 +1563,27 @@ StripesForRelfilenode(RelFileLocator relfilelocator, ScanDirection scanDirection
 }
 
 
+List *
+StripesForRelation(Relation relation, ScanDirection scanDirection)
+{
+	uint64 storageId = LookupStorageIdByRelation(relation);
+
+	return ReadDataFileStripeList(storageId, GetTransactionSnapshot(), scanDirection);
+}
+
+
 /*
  * DeletedRowsForStripe returns number of deleted rows for stripe
  * of the given relfilelocator.
  */
-uint32
-DeletedRowsForStripe(RelFileLocator relfilelocator, uint32 chunkCount, uint64 stripeId)
+static uint32
+DeletedRowsForStripeStorageId(uint64 storageId, uint32 chunkCount, uint64 stripeId)
 {
-	uint64 storageId = LookupStorageId(relfilelocator);
-
 	uint32 *chunkGroupRowCounts;
 	uint32 *chunkGroupDeletedRows;
 	int i;
-
 	uint32 deletedRows = 0;
-	
+
 	ReadChunkGroupRowCounts(storageId, stripeId, chunkCount,
 							&chunkGroupRowCounts, &chunkGroupDeletedRows,
 							GetTransactionSnapshot());
@@ -1560,6 +1597,22 @@ DeletedRowsForStripe(RelFileLocator relfilelocator, uint32 chunkCount, uint64 st
 	pfree(chunkGroupDeletedRows);
 
 	return deletedRows;
+}
+
+
+uint32
+DeletedRowsForStripe(RelFileLocator relfilelocator, uint32 chunkCount, uint64 stripeId)
+{
+	return DeletedRowsForStripeStorageId(LookupStorageId(relfilelocator), chunkCount,
+										 stripeId);
+}
+
+
+uint32
+DeletedRowsForStripeByRelation(Relation relation, uint32 chunkCount, uint64 stripeId)
+{
+	return DeletedRowsForStripeStorageId(LookupStorageIdByRelation(relation), chunkCount,
+										 stripeId);
 }
 
 /*
@@ -1887,20 +1940,9 @@ BuildStripeMetadata(Relation columnarStripes, HeapTuple heapTuple)
  * DeleteMetadataRows removes the rows with given relfilelocator from columnar
  * metadata tables.
  */
-void
-DeleteMetadataRows(RelFileLocator relfilelocator)
+static void
+DeleteMetadataRowsStorageId(uint64 storageId)
 {
-	/*
-	 * During a restore for binary upgrade, metadata tables and indexes may or
-	 * may not exist.
-	 */
-	if (IsBinaryUpgrade)
-	{
-		return;
-	}
-
-	uint64 storageId = LookupStorageId(relfilelocator);
-
 	DeleteStorageFromColumnarMetadataTable(ColumnarStripeRelationId(),
 										   Anum_columnar_stripe_storageid,
 										   ColumnarStripePKeyIndexRelationId(),
@@ -1920,12 +1962,8 @@ DeleteMetadataRows(RelFileLocator relfilelocator)
 }
 
 
-/*
- * DeleteMetadataRowsForStripeId removes the rows with given relfilelocator and 
- * stripe id from columnar metadata tables.
- */
 void
-DeleteMetadataRowsForStripeId(RelFileLocator relfilelocator, uint64 stripeId)
+DeleteMetadataRows(RelFileLocator relfilelocator)
 {
 	/*
 	 * During a restore for binary upgrade, metadata tables and indexes may or
@@ -1936,8 +1974,29 @@ DeleteMetadataRowsForStripeId(RelFileLocator relfilelocator, uint64 stripeId)
 		return;
 	}
 
-	uint64 storageId = LookupStorageId(relfilelocator);
+	DeleteMetadataRowsStorageId(LookupStorageId(relfilelocator));
+}
 
+
+void
+DeleteMetadataRowsByRelation(Relation relation)
+{
+	if (IsBinaryUpgrade)
+	{
+		return;
+	}
+
+	DeleteMetadataRowsStorageId(LookupStorageIdByRelation(relation));
+}
+
+
+/*
+ * DeleteMetadataRowsForStripeId removes the rows with given relfilelocator and 
+ * stripe id from columnar metadata tables.
+ */
+static void
+DeleteMetadataRowsForStripeIdStorageId(uint64 storageId, uint64 stripeId)
+{
 	DeleteStripeFromColumnarMetadataTable(
 		ColumnarStripeRelationId(),
 		Anum_columnar_stripe_storageid,
@@ -1962,6 +2021,30 @@ DeleteMetadataRowsForStripeId(RelFileLocator relfilelocator, uint64 stripeId)
 		Anum_columnar_row_mask_stripe_id,
 		ColumnarRowMaskStripeIndexRelationId(),
 		storageId, stripeId);
+}
+
+
+void
+DeleteMetadataRowsForStripeId(RelFileLocator relfilelocator, uint64 stripeId)
+{
+	if (IsBinaryUpgrade)
+	{
+		return;
+	}
+
+	DeleteMetadataRowsForStripeIdStorageId(LookupStorageId(relfilelocator), stripeId);
+}
+
+
+void
+DeleteMetadataRowsForStripeIdByRelation(Relation relation, uint64 stripeId)
+{
+	if (IsBinaryUpgrade)
+	{
+		return;
+	}
+
+	DeleteMetadataRowsForStripeIdStorageId(LookupStorageIdByRelation(relation), stripeId);
 }
 
 
@@ -2415,6 +2498,17 @@ ColumnarNamespaceId(void)
 
 
 /*
+ * LookupStorageIdByRelation reads storage metapage to find the storage ID for
+ * the given relation.
+ */
+uint64
+LookupStorageIdByRelation(Relation relation)
+{
+	return ColumnarStorageGetStorageId(relation, false);
+}
+
+
+/*
  * LookupStorageId reads storage metapage to find the storage ID for the given relfilelocator. It returns
  * false if the relation doesn't have a meta page yet.
  */
@@ -2426,7 +2520,7 @@ LookupStorageId(RelFileLocator relfilelocator)
 											  relfilelocator));
 
 	Relation relation = relation_open(relationId, AccessShareLock);
-	uint64 storageId = ColumnarStorageGetStorageId(relation, false);
+	uint64 storageId = LookupStorageIdByRelation(relation);
 	table_close(relation, AccessShareLock);
 
 	return storageId;

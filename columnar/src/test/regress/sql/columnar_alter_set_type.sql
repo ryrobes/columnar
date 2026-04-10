@@ -31,14 +31,28 @@ SELECT * FROM test_alter_table ORDER BY a;
 DROP TABLE test_alter_table;
 
 -- Make sure that the correct table options are used when rewriting the table.
--- This is reflected by the VACUUM VERBOSE output right after a rewrite showing
--- that all chunks are compressed with the configured compression algorithm
+-- Verify this through metadata instead of VACUUM VERBOSE output because the
+-- raw storage ids vary with prior test state.
 CREATE TABLE test(i int) USING columnar;
 SELECT columnar.alter_columnar_table_set('test', compression => 'lz4');
 INSERT INTO test VALUES(1);
-VACUUM VERBOSE test;
+
+SELECT storage_id AS old_storage_id
+FROM columnar_test_helpers.columnar_storage_info('test') \gset
+
+SELECT count(*) > 0 AND bool_and(value_compression_type = 2) AS old_storage_uses_lz4
+FROM columnar.chunk
+WHERE storage_id = :old_storage_id;
 
 ALTER TABLE test ALTER COLUMN i TYPE int8;
-VACUUM VERBOSE test;
+
+SELECT storage_id AS new_storage_id
+FROM columnar_test_helpers.columnar_storage_info('test') \gset
+
+SELECT :old_storage_id <> :new_storage_id AS storage_changed;
+
+SELECT count(*) > 0 AND bool_and(value_compression_type = 2) AS new_storage_uses_lz4
+FROM columnar.chunk
+WHERE storage_id = :new_storage_id;
 
 DROP TABLE test;

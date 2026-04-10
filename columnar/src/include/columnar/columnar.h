@@ -274,7 +274,7 @@ extern void columnar_init(void);
 extern CompressionType ParseCompressionType(const char *compressionTypeString);
 
 /* Function declarations for writing to a columnar table */
-extern ColumnarWriteState * ColumnarBeginWrite(RelFileLocator relfilelocator,
+extern ColumnarWriteState * ColumnarBeginWrite(Relation relation,
 											   ColumnarOptions options,
 											   TupleDesc tupleDescriptor);
 extern uint64 ColumnarWriteRow(ColumnarWriteState *state, Datum *columnValues,
@@ -329,6 +329,7 @@ extern uint64 ColumnarTableRowCount(Relation relation);
 extern const char * CompressionTypeStr(CompressionType type);
 extern ItemPointerData row_number_to_tid(uint64 rowNumber);
 extern uint64 LookupStorageId(RelFileLocator relfilelocator);
+extern uint64 LookupStorageIdByRelation(Relation relation);
 
 /* columnar_metadata_tables.c */
 extern void InitColumnarOptions(Oid regclass);
@@ -340,6 +341,8 @@ extern bool IsColumnarTableAmTable(Oid relationId);
 /* columnar_metadata_tables.c */
 extern void DeleteMetadataRows(RelFileLocator relfilelocator);
 extern void DeleteMetadataRowsForStripeId(RelFileLocator relfilelocator, uint64 stripeId);
+extern void DeleteMetadataRowsByRelation(Relation relation);
+extern void DeleteMetadataRowsForStripeIdByRelation(Relation relation, uint64 stripeId);
 extern uint64 ColumnarMetadataNewStorageId(void);
 extern uint64 GetHighestUsedAddress(RelFileLocator relfilelocator);
 extern EmptyStripeReservation * ReserveEmptyStripe(Relation rel, uint64 columnCount,
@@ -348,10 +351,10 @@ extern EmptyStripeReservation * ReserveEmptyStripe(Relation rel, uint64 columnCo
 extern StripeMetadata * CompleteStripeReservation(Relation rel, uint64 stripeId,
 												  uint64 sizeBytes, uint64 rowCount,
 												  uint64 chunkCount);
-extern void SaveStripeSkipList(RelFileLocator relfilelocator, uint64 stripe,
+extern void SaveStripeSkipList(uint64 storageId, uint64 stripe,
 							   StripeSkipList *stripeSkipList,
 							   TupleDesc tupleDescriptor);
-extern void SaveChunkGroups(RelFileLocator relfilelocator, uint64 stripe,
+extern void SaveChunkGroups(uint64 storageId, uint64 stripe,
 							List *chunkGroupRowCounts);
 extern void UpdateChunkGroupDeletedRows(uint64 storageId, uint64 stripe,
 										uint32 chunkGroupId, uint32 deletedRowNumber);
@@ -359,6 +362,13 @@ extern StripeSkipList * ReadStripeSkipList(RelFileLocator relfilelocator, uint64
 										   TupleDesc tupleDescriptor,
 										   uint32 chunkCount,
 										   Snapshot snapshot);
+extern StripeSkipList * ReadStripeSkipListByRelation(Relation relation, uint64 stripe,
+													 TupleDesc tupleDescriptor,
+													 uint32 chunkCount,
+													 Snapshot snapshot);
+extern List * StripesForRelation(Relation relation, ScanDirection scanDirection);
+extern uint32 DeletedRowsForStripeByRelation(Relation relation, uint32 chunkCount,
+											 uint64 stripeId);
 extern StripeMetadata * FindNextStripeByRowNumber(Relation relation, uint64 rowNumber,
 												  Snapshot snapshot);
 extern StripeMetadata * FindStripeByRowNumber(Relation relation, uint64 rowNumber,
@@ -383,6 +393,9 @@ extern void FlushRowMaskCache(RowMaskWriteStateEntry *rowMaskEntry);
 extern bytea * ReadChunkRowMask(RelFileLocator relfilelocator, Snapshot snapshot,
 								MemoryContext ctx,
 								uint64 stripeFirstRowNumber, int rowCount);
+extern bytea * ReadChunkRowMaskByRelation(Relation relation, Snapshot snapshot,
+										  MemoryContext ctx,
+										  uint64 stripeFirstRowNumber, int rowCount);
 extern Datum create_table_row_mask(PG_FUNCTION_ARGS);
 extern EState * create_estate_for_relation(Relation rel);
 
@@ -448,7 +461,8 @@ extern void CleanupReadStateCache(SubTransactionId currentSubXid);
 extern MemoryContext GetColumnarReadStateCache(void);
 
 /* columnar_cache.c */
-extern void ColumnarMarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId);
+extern void ColumnarMarkChunkGroupInUse(uint64 ownerId, uint64 relId, uint64 stripeId,
+										uint32 chunkId);
 extern void ColumnarAddCacheEntry(uint64, uint64, uint64, uint32, void *);
 extern void *ColumnarRetrieveCache(uint64, uint64, uint64, uint32);
 extern void ColumnarResetCache(void);

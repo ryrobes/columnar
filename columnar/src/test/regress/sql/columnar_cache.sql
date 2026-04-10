@@ -10,10 +10,11 @@ INSERT INTO big_table (id, firstname, lastname)
          CONCAT('lastname-', i)
     FROM generate_series(1, 1000000) as i;
 
--- get some baselines from multiple chunks
+-- capture a baseline that spans multiple chunks and scan nodes
+CREATE TEMP TABLE big_table_baseline AS
 SELECT firstname,
        lastname,
-       SUM(id)
+       SUM(id) AS total_id
   FROM big_table
  WHERE id < 1000
  GROUP BY firstname,
@@ -21,36 +22,81 @@ SELECT firstname,
 UNION
 SELECT firstname,
        lastname,
-       SUM(id)
+       SUM(id) AS total_id
   FROM big_table
  WHERE id BETWEEN 15000 AND 16000
  GROUP BY firstname,
-       lastname
- ORDER BY firstname;
+       lastname;
+
+SELECT COUNT(*)
+  FROM big_table_baseline;
 
 
 -- enable caching
 SET columnar.enable_column_cache = 't';
 
--- the results should be the same as above
-SELECT firstname,
-       lastname,
-       SUM(id)
-  FROM big_table
- WHERE id < 1000
- GROUP BY firstname,
-       lastname
-UNION
-SELECT firstname,
-       lastname,
-       SUM(id)
-  FROM big_table
- WHERE id BETWEEN 15000 AND 16000
- GROUP BY firstname,
-       lastname
- ORDER BY firstname;
+-- the cached results should match the baseline exactly
+SELECT COUNT(*)
+  FROM (
+    SELECT *
+      FROM big_table_baseline
+    EXCEPT
+    SELECT *
+      FROM (
+        SELECT firstname,
+               lastname,
+               SUM(id) AS total_id
+          FROM big_table
+         WHERE id < 1000
+         GROUP BY firstname,
+               lastname
+        UNION
+        SELECT firstname,
+               lastname,
+               SUM(id) AS total_id
+          FROM big_table
+         WHERE id BETWEEN 15000 AND 16000
+         GROUP BY firstname,
+               lastname
+      ) cached_rows
+  ) baseline_minus_cached;
+
+SELECT COUNT(*)
+  FROM (
+    SELECT *
+      FROM (
+        SELECT firstname,
+               lastname,
+               SUM(id) AS total_id
+          FROM big_table
+         WHERE id < 1000
+         GROUP BY firstname,
+               lastname
+        UNION
+        SELECT firstname,
+               lastname,
+               SUM(id) AS total_id
+          FROM big_table
+         WHERE id BETWEEN 15000 AND 16000
+         GROUP BY firstname,
+               lastname
+      ) cached_rows
+    EXCEPT
+    SELECT *
+      FROM big_table_baseline
+  ) cached_minus_baseline;
+
+DROP TABLE big_table_baseline;
 
 -- disable caching
+SET columnar.enable_column_cache = 'f';
+
+-- regular single-row inserts should not leak the disabled cache state
+SET columnar.enable_column_cache = 't';
+CREATE TABLE cache_flag_probe (i INT) USING columnar;
+INSERT INTO cache_flag_probe VALUES (1);
+SELECT current_setting('columnar.enable_column_cache');
+DROP TABLE cache_flag_probe;
 SET columnar.enable_column_cache = 'f';
 
 CREATE TABLE test_2 (
@@ -108,6 +154,8 @@ SELECT SUM(value)
 COMMIT;
 
 DROP TABLE test_2;
+
+SET columnar.enable_column_cache = 'f';
 
 CREATE TABLE t1 (i int) USING columnar;
 

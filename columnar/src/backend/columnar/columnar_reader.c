@@ -603,21 +603,12 @@ ReadStripeRowByRowNumber(ColumnarReadState *readState,
 			}
 			else if (stripeReadState->chunkGroupReadState->chunkGroupDeletedRows > 0)
 			{
-#if PG_VERSION_NUM >= PG_VERSION_16
 				stripeReadState->chunkGroupReadState->rowMask =
-					ReadChunkRowMask(stripeReadState->relation->rd_locator,
-										readState->snapshot,
-										stripeReadState->stripeReadContext,
-										chunkFirstRowNumber,
-										stripeReadState->chunkGroupReadState->rowCount);
-#else
-				stripeReadState->chunkGroupReadState->rowMask =
-					ReadChunkRowMask(stripeReadState->relation->rd_node,
-										readState->snapshot,
-										stripeReadState->stripeReadContext,
-										chunkFirstRowNumber,
-										stripeReadState->chunkGroupReadState->rowCount);
-#endif
+					ReadChunkRowMaskByRelation(stripeReadState->relation,
+											   readState->snapshot,
+											   stripeReadState->stripeReadContext,
+											   chunkFirstRowNumber,
+											   stripeReadState->chunkGroupReadState->rowCount);
 				stripeReadState->chunkGroupReadState->rowMaskCached = false;
 			}
 		}
@@ -957,21 +948,12 @@ ReadStripeNextRow(StripeReadState *stripeReadState, Datum *columnValues,
 				uint64 chunkFirstRowNumber = 
 					stripeFirstRowNumber + 
 					stripeReadState->chunkGroupReadState->chunkStripeRowOffset;
-#if PG_VERSION_NUM >= PG_VERSION_16
-				stripeReadState->chunkGroupReadState->rowMask = 
-					ReadChunkRowMask(stripeReadState->relation->rd_locator,
-									 snapshot,
-									 stripeReadState->stripeReadContext,
-									 chunkFirstRowNumber,
-									 stripeReadState->chunkGroupReadState->rowCount);
-#else
-				stripeReadState->chunkGroupReadState->rowMask = 
-					ReadChunkRowMask(stripeReadState->relation->rd_node,
-									 snapshot,
-									 stripeReadState->stripeReadContext,
-									 chunkFirstRowNumber,
-									 stripeReadState->chunkGroupReadState->rowCount);
-#endif
+				stripeReadState->chunkGroupReadState->rowMask =
+					ReadChunkRowMaskByRelation(stripeReadState->relation,
+											   snapshot,
+											   stripeReadState->stripeReadContext,
+											   chunkFirstRowNumber,
+											   stripeReadState->chunkGroupReadState->rowCount);
 				stripeReadState->chunkGroupReadState->rowMaskCached = false;
 			}
 			else
@@ -1250,11 +1232,7 @@ ColumnarTableRowCount(Relation relation)
 {
 	ListCell *stripeMetadataCell = NULL;
 	uint64 totalRowCount = 0;
-#if PG_VERSION_NUM >= PG_VERSION_16
-	List *stripeList = StripesForRelfilenode(relation->rd_locator, ForwardScanDirection);
-#else
-	List *stripeList = StripesForRelfilenode(relation->rd_node, ForwardScanDirection);
-#endif
+	List *stripeList = StripesForRelation(relation, ForwardScanDirection);
 
 	foreach(stripeMetadataCell, stripeList)
 	{
@@ -1282,19 +1260,11 @@ LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 
 	bool *projectedColumnMask = ProjectedColumnMask(columnCount, projectedColumnList);
 
-#if PG_VERSION_NUM >= PG_VERSION_16
-	StripeSkipList *stripeSkipList = ReadStripeSkipList(relation->rd_locator,
-														stripeMetadata->id,
-														tupleDescriptor,
-														stripeMetadata->chunkCount,
-														snapshot);
-#else
-	StripeSkipList *stripeSkipList = ReadStripeSkipList(relation->rd_node,
-														stripeMetadata->id,
-														tupleDescriptor,
-														stripeMetadata->chunkCount,
-														snapshot);
-#endif
+	StripeSkipList *stripeSkipList = ReadStripeSkipListByRelation(relation,
+														  stripeMetadata->id,
+														  tupleDescriptor,
+														  stripeMetadata->chunkCount,
+														  snapshot);
 	bool *selectedChunkMask = SelectedChunkMask(stripeSkipList, whereClauseList,
 												whereClauseVars, chunkGroupsFiltered);
 
@@ -1913,12 +1883,15 @@ DeserializeChunkData(StripeBuffers *stripeBuffers, uint64 chunkIndex,
 		{
 			ColumnChunkBuffers *chunkBuffers =
 				columnBuffers->chunkBuffersArray[chunkIndex];
-			bool shouldCache = columnar_enable_page_cache == true && chunkBuffers->valueCompressionType != COMPRESSION_NONE;
+				bool shouldCache = columnar_enable_page_cache == true && chunkBuffers->valueCompressionType != COMPRESSION_NONE;
 
-			if (shouldCache)
-			{
-				ColumnarMarkChunkGroupInUse(state->relation->rd_id, stripeId, chunkIndex);
-			}
+				if (shouldCache)
+				{
+					ColumnarMarkChunkGroupInUse((uint64) (uintptr_t) state,
+											   state->relation->rd_id,
+											   stripeId,
+											   chunkIndex);
+				}
 
 			/* decompress and deserialize current chunk's data */
 			StringInfo valueBuffer = NULL;
@@ -2119,21 +2092,12 @@ ReadStripeNextVector(StripeReadState *stripeReadState, Datum *columnValues,
 			if (columnar_enable_dml &&
 				stripeReadState->chunkGroupReadState->chunkGroupDeletedRows != 0)
 			{
-#if PG_VERSION_NUM >= PG_VERSION_16
 				stripeReadState->chunkGroupReadState->rowMask =
-					ReadChunkRowMask(stripeReadState->relation->rd_locator,
-									 snapshot,
-									 stripeReadState->stripeReadContext,
-									 chunkFirstRowNumber,
-									 stripeReadState->chunkGroupReadState->rowCount);
-#else
-				stripeReadState->chunkGroupReadState->rowMask =
-					ReadChunkRowMask(stripeReadState->relation->rd_node,
-									 snapshot,
-									 stripeReadState->stripeReadContext,
-									 chunkFirstRowNumber,
-									 stripeReadState->chunkGroupReadState->rowCount);
-#endif
+					ReadChunkRowMaskByRelation(stripeReadState->relation,
+											   snapshot,
+											   stripeReadState->stripeReadContext,
+											   chunkFirstRowNumber,
+											   stripeReadState->chunkGroupReadState->rowCount);
 			}
 			else
 			{

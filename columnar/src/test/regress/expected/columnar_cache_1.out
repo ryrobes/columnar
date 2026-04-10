@@ -3053,6 +3053,18 @@ SELECT firstname,
 
 -- disable caching
 SET columnar.enable_column_cache = 'f';
+-- regular single-row inserts should not leak the disabled cache state
+SET columnar.enable_column_cache = 't';
+CREATE TABLE cache_flag_probe (i INT) USING columnar;
+INSERT INTO cache_flag_probe VALUES (1);
+SELECT current_setting('columnar.enable_column_cache');
+ current_setting 
+-----------------
+ on
+(1 row)
+
+DROP TABLE cache_flag_probe;
+SET columnar.enable_column_cache = 'f';
 CREATE TABLE test_2 (
   value INT,
   updated_value INT
@@ -3122,6 +3134,7 @@ SELECT SUM(value)
 
 COMMIT;
 DROP TABLE test_2;
+SET columnar.enable_column_cache = 'f';
 CREATE TABLE t1 (i int) USING columnar;
 INSERT INTO t1 SELECT generate_series(1, 1000000, 1);
 EXPLAIN SELECT COUNT(*) FROM t1;

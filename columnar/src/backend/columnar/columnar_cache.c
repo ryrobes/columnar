@@ -18,6 +18,7 @@
 #include "funcapi.h"
 #include "lib/ilist.h"
 #include "lib/stringinfo.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 
@@ -39,25 +40,32 @@ static MemoryContext columnarCacheContext = NULL;
  * An entry for caching a column.
  */
 typedef struct ColumnarCacheEntry ColumnarCacheEntry;
+typedef struct ColumnarCacheKey ColumnarCacheKey;
 
-struct ColumnarCacheEntry
+struct ColumnarCacheKey
 {
-	dlist_node list_node;
 	uint64 relId;
 	uint64 stripeId;
 	uint64 chunkId;
+	uint32 columnId;
+};
+
+struct ColumnarCacheEntry
+{
+	ColumnarCacheKey key;
+	dlist_node list_node;
 	uint64 readCount;
 	uint64 length;
 	time_t creationTime;
 	time_t lastAccessTime;
 	void *store;
-	uint32 columnId;
 };
 
 /*
- * Storage for the ColumnarCacheEntry linked list.
+ * Storage for cache entries.
  */
-static dlist_head *head = NULL;
+static HTAB *cacheEntryMap = NULL;
+static dlist_head cacheEntryList;
 
 /*
  * Storage for total length allocated.
@@ -76,12 +84,19 @@ static ColumnarCacheStatistics statistics = { 0 };
  */
 typedef struct ColumarCacheChunkGroupInUse
 {
+	uint64 ownerId;
 	uint64 relId;
 	uint64 stripeId;
 	uint64 chunkId;
 } ColumarCacheChunkGroupInUse;
 
 static List * ChunkGroupsInUse = NIL;
+
+static void FreeCacheEntryStore(ColumnarCacheEntry *entry);
+static uint64 RemoveCacheEntry(ColumnarCacheEntry *entry);
+static ColumnarCacheEntry * ColumnarFindInCache(uint64 relId, uint64 stripeId,
+												uint64 chunkId, uint32 columnId,
+												bool recordAccess);
 
 /*
  * ColumnarCacheMemoryContext
@@ -95,13 +110,23 @@ ColumnarCacheMemoryContext(void)
 {
 	if (columnarCacheContext == NULL)
 	{
+		HASHCTL info;
+		uint32 hashFlags = (HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
 		columnarCacheContext = 
 			AllocSetContextCreate(TopMemoryContext, 
 								  "Columnar Decompression Cache", 
 								  0, (uint64) (columnar_page_cache_size * 1024 * 1024 * .1), 
 								  columnar_page_cache_size * 1024 * 1024);
 		memset(&statistics, 0, sizeof(ColumnarCacheStatistics));
-		head = NULL;
+		memset(&info, 0, sizeof(info));
+		info.keysize = sizeof(ColumnarCacheKey);
+		info.entrysize = sizeof(ColumnarCacheEntry);
+		info.hcxt = columnarCacheContext;
+		cacheEntryMap = hash_create("columnar decompression cache map",
+									64, &info, hashFlags);
+		dlist_init(&cacheEntryList);
+		ChunkGroupsInUse = NIL;
 	}
 
 	return columnarCacheContext;
@@ -120,11 +145,11 @@ ColumnarResetCache(void)
 	{
 		MemoryContextDelete(columnarCacheContext);
 		columnarCacheContext = NULL;
+		cacheEntryMap = NULL;
 		ChunkGroupsInUse = NIL;
 	}
 
 	totalAllocationLength = 0U;
-	head = NULL;
 }
 
 /*
@@ -135,28 +160,33 @@ ColumnarResetCache(void)
  * none are found, NULL is returned instead.
  */
 static ColumnarCacheEntry *
-ColumnarFindInCache(uint64 relId, uint64 stripeId, uint64 chunkId, uint32 columnId)
+ColumnarFindInCache(uint64 relId, uint64 stripeId, uint64 chunkId, uint32 columnId,
+					bool recordAccess)
 {
-	if (head == NULL)
+	if (cacheEntryMap == NULL)
 	{
 		return NULL;
 	}
 
-	dlist_iter iter;
-	dlist_foreach(iter, head)
+	ColumnarCacheKey key = {
+		.relId = relId,
+		.stripeId = stripeId,
+		.chunkId = chunkId,
+		.columnId = columnId,
+	};
+	ColumnarCacheEntry *entry = hash_search(cacheEntryMap, &key, HASH_FIND, NULL);
+	if (entry == NULL)
 	{
-		ColumnarCacheEntry *entry = dlist_container(ColumnarCacheEntry, list_node, iter.cur);
-
-		if (entry->relId == relId && entry->stripeId == stripeId &&
-			entry->chunkId == chunkId && entry->columnId == columnId)
-		{
-			entry->readCount++;
-
-			return entry;
-		}
+		return NULL;
 	}
 
-	return NULL;
+	if (recordAccess)
+	{
+		entry->readCount++;
+		entry->lastAccessTime = time(NULL);
+	}
+
+	return entry;
 }
 
 /*
@@ -171,24 +201,24 @@ ColumnarFindInCache(uint64 relId, uint64 stripeId, uint64 chunkId, uint32 column
 static bool
 ColumnarInvalidateCacheEntry(uint64 relId, uint64 stripeId, uint64 chunkId, uint32 columnId)
 {
-	dlist_mutable_iter miter;
-
-	dlist_foreach_modify(miter, head)
+	if (cacheEntryMap == NULL)
 	{
-		ColumnarCacheEntry *entry = dlist_container(ColumnarCacheEntry, list_node, miter.cur);
-
-		if (entry->relId == relId && entry->stripeId == stripeId &&
-			entry->chunkId == chunkId && entry->columnId == columnId)
-		{
-			dlist_delete(miter.cur);
-
-			totalAllocationLength -= entry->length;
-			statistics.evictions++;
-
-			return true;
-		}
+		return true;
 	}
 
+	ColumnarCacheKey key = {
+		.relId = relId,
+		.stripeId = stripeId,
+		.chunkId = chunkId,
+		.columnId = columnId,
+	};
+	ColumnarCacheEntry *entry = hash_search(cacheEntryMap, &key, HASH_FIND, NULL);
+	if (entry == NULL)
+	{
+		return true;
+	}
+
+	RemoveCacheEntry(entry);
 	return true;
 }
 
@@ -202,7 +232,7 @@ EvictCache(uint64 size)
 	{
 		dlist_mutable_iter miter;
 
-		dlist_foreach_modify(miter, head)
+		dlist_foreach_modify(miter, &cacheEntryList)
 		{
 			ColumnarCacheEntry *entry = dlist_container(ColumnarCacheEntry, list_node, miter.cur);
 
@@ -217,44 +247,29 @@ EvictCache(uint64 size)
 				ListCell *lc;
 				foreach(lc, ChunkGroupsInUse)
 				{
-					ColumarCacheChunkGroupInUse *chunkGroupInUse =
-						(ColumarCacheChunkGroupInUse *) lfirst(lc);
+						ColumarCacheChunkGroupInUse *chunkGroupInUse =
+							(ColumarCacheChunkGroupInUse *) lfirst(lc);
 
-					if (chunkGroupInUse->relId == entry->relId &&
-						chunkGroupInUse->stripeId == entry->stripeId &&
-						chunkGroupInUse->chunkId == entry->chunkId)
+						if (chunkGroupInUse->relId == entry->key.relId &&
+							chunkGroupInUse->stripeId == entry->key.stripeId &&
+							chunkGroupInUse->chunkId == entry->key.chunkId)
+						{
+							skipCacheEntry = true;
+							break;
+						}
+				}
+
+					if (skipCacheEntry)
+						continue;
+
+					uint64 freedSize = RemoveCacheEntry(entry);
+					if (size < freedSize)
 					{
-						skipCacheEntry = true;
-						break;
+						return;
 					}
-				}
-
-				if (skipCacheEntry)
-					continue;
-
-				dlist_delete(miter.cur);
-
-				totalAllocationLength -= entry->length;
-				statistics.evictions++;
-
-				StringInfo str = entry->store;
-				if (str->data) {
-					pfree(str->data);
-				}
-
-				pfree(str);
-
-				if (size < entry->length)
-				{
-					pfree(entry);
-					return;
-				}
-				else {
-					size -= entry->length;
-					pfree(entry);
+					size -= freedSize;
 				}
 			}
-		}
 
 		lastCount = nextLowestCount;
 		nextLowestCount = PG_UINT64_MAX;
@@ -262,7 +277,7 @@ EvictCache(uint64 size)
 }
 
 void
-ColumnarMarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId)
+ColumnarMarkChunkGroupInUse(uint64 ownerId, uint64 relId, uint64 stripeId, uint32 chunkId)
 {
 	bool found = false;
 	ListCell *lc;
@@ -270,26 +285,29 @@ ColumnarMarkChunkGroupInUse(uint64 relId, uint64 stripeId, uint32 chunkId)
 	MemoryContext ctx = MemoryContextSwitchTo(ColumnarCacheMemoryContext());
 
 	foreach(lc, ChunkGroupsInUse)
-	{
-		ColumarCacheChunkGroupInUse *chunkGroupInUse =
-			(ColumarCacheChunkGroupInUse *) lfirst(lc);
-
-		if (chunkGroupInUse->relId == relId)
 		{
-			chunkGroupInUse->stripeId = stripeId;
-			chunkGroupInUse->chunkId = chunkId;
-			found = true;
+			ColumarCacheChunkGroupInUse *chunkGroupInUse =
+				(ColumarCacheChunkGroupInUse *) lfirst(lc);
+
+			if (chunkGroupInUse->ownerId == ownerId)
+			{
+				chunkGroupInUse->ownerId = ownerId;
+				chunkGroupInUse->stripeId = stripeId;
+				chunkGroupInUse->chunkId = chunkId;
+				chunkGroupInUse->relId = relId;
+				found = true;
+			}
 		}
-	}
 
 	if (!found)
 	{
-		ColumarCacheChunkGroupInUse *newChunkGroupInUse =
-			palloc0(sizeof(ColumarCacheChunkGroupInUse));
+			ColumarCacheChunkGroupInUse *newChunkGroupInUse =
+				palloc0(sizeof(ColumarCacheChunkGroupInUse));
 
-		newChunkGroupInUse->relId = relId;
-		newChunkGroupInUse->stripeId = stripeId;
-		newChunkGroupInUse->chunkId = chunkId;
+			newChunkGroupInUse->ownerId = ownerId;
+			newChunkGroupInUse->relId = relId;
+			newChunkGroupInUse->stripeId = stripeId;
+			newChunkGroupInUse->chunkId = chunkId;
 
 		ChunkGroupsInUse = lappend(ChunkGroupsInUse, newChunkGroupInUse);
 	}
@@ -313,39 +331,33 @@ ColumnarAddCacheEntry(uint64 relId, uint64 stripeId, uint64 chunkId,
 
 	MemoryContext oldContext = MemoryContextSwitchTo(ColumnarCacheMemoryContext());
 
-	if (head == NULL)
-	{
-		head = palloc0(sizeof(dlist_head));
-	}
-
-	ColumnarCacheEntry *entry = ColumnarFindInCache(relId, stripeId, chunkId, columnId);
+	ColumnarCacheEntry *entry = ColumnarFindInCache(relId, stripeId, chunkId, columnId,
+													false);
 
 	if (entry != NULL)
 	{
-		/* Free up any existing stored data, everything else will be overwritten. */
-		StringInfo str = entry->store;
-		if (str->data)
-		{
-			pfree(str->data);
-		}
-
-		pfree(str);
-
+		FreeCacheEntryStore(entry);
 		totalAllocationLength -= entry->length;
 	}
 	else
 	{
-		entry = palloc0(sizeof(ColumnarCacheEntry));
+		ColumnarCacheKey key = {
+			.relId = relId,
+			.stripeId = stripeId,
+			.chunkId = chunkId,
+			.columnId = columnId,
+		};
+		bool found = false;
 
-		entry->relId = relId;
-		entry->stripeId = stripeId;
-		entry->chunkId = chunkId;
-		entry->columnId = columnId;
+		entry = hash_search(cacheEntryMap, &key, HASH_ENTER, &found);
+		Assert(!found);
+		memset(entry, 0, sizeof(ColumnarCacheEntry));
+		entry->key = key;
 		entry->creationTime = entry->lastAccessTime = time(NULL);
 		entry->readCount = 0;
 
 		/* Add the entry into the list. */
-		dlist_push_tail(head, &(entry->list_node));
+		dlist_push_tail(&cacheEntryList, &(entry->list_node));
 	}
 
 	uint64 size = ((StringInfo) data)->len;
@@ -386,7 +398,8 @@ ColumnarRetrieveCache(uint64 relId, uint64 stripeId, uint64 chunkId, uint32 colu
 		return NULL;
 	}
 
-	ColumnarCacheEntry *entry = ColumnarFindInCache(relId, stripeId, chunkId, columnId);
+	ColumnarCacheEntry *entry = ColumnarFindInCache(relId, stripeId, chunkId, columnId,
+													true);
 
 	if (entry == NULL)
 	{
@@ -412,13 +425,13 @@ ColumnarCacheLength()
 {
 	uint64 count = 0;
 
-	if (head == NULL)
+	if (cacheEntryMap == NULL)
 	{
 		return 0;
 	}
 
 	dlist_iter iter;
-	dlist_foreach(iter, head)
+	dlist_foreach(iter, &cacheEntryList)
 	{
 		count++;
 	}
@@ -465,4 +478,38 @@ Datum cache_evict(PG_FUNCTION_ARGS)
 	bool result = ColumnarInvalidateCacheEntry(relId, stripeId, chunkId, columnId);
 
 	PG_RETURN_BOOL(result);
+}
+
+static void
+FreeCacheEntryStore(ColumnarCacheEntry *entry)
+{
+	StringInfo str = entry->store;
+
+	if (str == NULL)
+	{
+		return;
+	}
+
+	if (str->data)
+	{
+		pfree(str->data);
+	}
+
+	pfree(str);
+	entry->store = NULL;
+}
+
+static uint64
+RemoveCacheEntry(ColumnarCacheEntry *entry)
+{
+	ColumnarCacheKey key = entry->key;
+	uint64 freedSize = entry->length;
+
+	dlist_delete(&(entry->list_node));
+	FreeCacheEntryStore(entry);
+	totalAllocationLength -= freedSize;
+	statistics.evictions++;
+	hash_search(cacheEntryMap, &key, HASH_REMOVE, NULL);
+
+	return freedSize;
 }

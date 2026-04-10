@@ -38,6 +38,35 @@ SELECT COUNT(*)  = 3 FROM t;
 
 DROP TABLE t;
 
+-- 2b. check conversion after a parallel query in the same session
+
+CREATE TABLE parallel_am_probe (a INT) USING heap;
+
+INSERT INTO parallel_am_probe
+SELECT generate_series(1, 100000);
+
+SET force_parallel_mode = regress;
+SET min_parallel_table_scan_size = 1;
+SET parallel_tuple_cost = 0;
+SET max_parallel_workers = 4;
+SET max_parallel_workers_per_gather = 4;
+
+SELECT COUNT(*) FROM parallel_am_probe;
+
+SELECT columnar.alter_table_set_access_method('parallel_am_probe', 'columnar');
+
+SELECT COUNT(1) FROM pg_class
+WHERE relname = 'parallel_am_probe'
+  AND relam = (SELECT oid FROM pg_am WHERE amname = 'columnar');
+
+RESET force_parallel_mode;
+RESET min_parallel_table_scan_size;
+RESET parallel_tuple_cost;
+RESET max_parallel_workers;
+RESET max_parallel_workers_per_gather;
+
+DROP TABLE parallel_am_probe;
+
 -- 3. check conversion of tables with trigger
 
 CREATE TABLE t (a INT) USING heap;

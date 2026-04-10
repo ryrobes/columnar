@@ -23,6 +23,8 @@ DECLARE
     idx TEXT;
 
     saved_search_path TEXT;
+    saved_force_parallel_mode TEXT;
+    saved_max_parallel_workers_per_gather TEXT;
 
     constraint_list_name_and_definition TEXT[];
     constraint_name_and_definition TEXT;
@@ -198,8 +200,22 @@ BEGIN
     EXECUTE FORMAT('ALTER TABLE %s.%s RENAME TO %s;'::text, tbl_schema, temp_tbl_name, tbl_name);
 
     -- Since we inserted rows before they are not flushed so trigger flushing
+    -- Disable parallelism around the flush query because the read path may
+    -- update the active snapshot command id while making pending writes visible.
 
-    EXECUTE FORMAT('SELECT COUNT(1) FROM %s.%s LIMIT 1;'::text, tbl_schema, tbl_name);
+    SELECT current_setting('force_parallel_mode') INTO saved_force_parallel_mode;
+    SELECT current_setting('max_parallel_workers_per_gather')
+        INTO saved_max_parallel_workers_per_gather;
+
+    PERFORM set_config('force_parallel_mode', 'off', false);
+    PERFORM set_config('max_parallel_workers_per_gather', '0', false);
+
+    EXECUTE FORMAT('SELECT COUNT(1) FROM %s.%s LIMIT 1;'::text,
+                   tbl_schema, tbl_name);
+
+    PERFORM set_config('force_parallel_mode', saved_force_parallel_mode, false);
+    PERFORM set_config('max_parallel_workers_per_gather',
+                       saved_max_parallel_workers_per_gather, false);
 
     -- Set indexes 
 

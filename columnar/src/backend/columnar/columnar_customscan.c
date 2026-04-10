@@ -1650,7 +1650,7 @@ static Cost
 ColumnarPerStripeScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRead)
 {
 	Relation relation = RelationIdGetRelation(relationId);
-	List *stripeList = StripesForRelfilenode(RelationPhysicalIdentifier_compat(relation), ForwardScanDirection);
+	List *stripeList = StripesForRelation(relation, ForwardScanDirection);
 	RelationClose(relation);
 
 	uint32 maxColumnCount = 0;
@@ -1702,7 +1702,7 @@ static uint64
 ColumnarTableStripeCount(Oid relationId)
 {
 	Relation relation = RelationIdGetRelation(relationId);
-	List *stripeList = StripesForRelfilenode(RelationPhysicalIdentifier_compat(relation), ForwardScanDirection);
+	List *stripeList = StripesForRelation(relation, ForwardScanDirection);
 	int stripeCount = list_length(stripeList);
 	RelationClose(relation);
 

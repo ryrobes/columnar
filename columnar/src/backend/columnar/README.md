@@ -126,6 +126,139 @@ The following options are available:
   changed and may have more rows than this maximum value. The default
   value is `10000`.
 
+## Hybrid Storage Patterns
+
+For mixed OLTP / OLAP workloads, a practical pattern is to keep recent
+or mutable data in heap tables and use columnar for sealed or archival
+data.
+
+One option is mixed-access-method partitioning on a single parent
+table:
+
+```sql
+CREATE TABLE events (
+    event_time timestamptz,
+    run_id bigint,
+    payload jsonb
+) PARTITION BY RANGE (event_time);
+
+CREATE TABLE events_2026_04_10
+  PARTITION OF events
+  FOR VALUES FROM ('2026-04-10') TO ('2026-04-11')
+  USING heap;
+
+CREATE TABLE events_2026_04_09
+  PARTITION OF events
+  FOR VALUES FROM ('2026-04-09') TO ('2026-04-10')
+  USING columnar;
+```
+
+Another option is a hot/cold split where the hot table stays mutable in
+heap and completed work is archived into a cold columnar table.
+
+```sql
+CREATE TABLE run_state_hot (
+    run_id bigint,
+    step_no int,
+    status text,
+    finished_at timestamptz
+);
+
+CREATE TABLE run_state_cold
+  (LIKE run_state_hot INCLUDING DEFAULTS)
+  USING columnar;
+
+SELECT columnar.create_hot_cold_view(
+    'public.run_state_read',
+    'run_state_hot',
+    'run_state_cold');
+
+SELECT columnar.archive_to_cold(
+    'run_state_hot',
+    'run_state_cold',
+    'run_id = 42');
+```
+
+`columnar.archive_to_cold` can also be used with `delete_from_hot =>
+false` to copy rows into a columnar mirror before a separate prune step.
+
+### Policy-Driven Hot/Cold Archival
+
+For repeated archival workflows, the extension also provides a small
+metadata layer in the `columnar` schema.
+
+```sql
+CREATE OR REPLACE FUNCTION app.finished_run_selector(
+    policy_name text,
+    hot_table regclass,
+    cold_table regclass)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    ready_run_ids text;
+BEGIN
+    EXECUTE format(
+        'SELECT string_agg(run_id::text, '','' ORDER BY run_id) ' ||
+        'FROM (SELECT DISTINCT run_id FROM %s WHERE finished_at IS NOT NULL) ready',
+        hot_table)
+        INTO ready_run_ids;
+
+    IF ready_run_ids IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN format('run_id IN (%s)', ready_run_ids);
+END;
+$$;
+
+SELECT columnar.create_archive_policy(
+    'run_state_policy',
+    'app.run_state_hot',
+    'app.run_state_cold',
+    'app.finished_run_selector(text,regclass,regclass)',
+    'app.run_state_read');
+
+SELECT columnar.run_archive_policy('run_state_policy');
+
+SELECT * FROM columnar.run_archive_policies();
+```
+
+Policies are stored in `columnar.archive_policy`, and successful runs are
+logged in `columnar.archive_run_log`.
+
+### Manual Example
+
+If you want to do the same thing by hand without the metadata layer:
+
+```sql
+CREATE TABLE app.run_state_hot (
+    run_id bigint,
+    step_no int,
+    status text,
+    finished_at timestamptz
+) USING heap;
+
+CREATE TABLE app.run_state_cold
+  (LIKE app.run_state_hot INCLUDING DEFAULTS)
+  USING columnar;
+
+SELECT columnar.create_hot_cold_view(
+    'app.run_state_read',
+    'app.run_state_hot',
+    'app.run_state_cold');
+
+INSERT INTO app.run_state_hot VALUES
+    (42, 1, 'done',    '2026-04-10 12:00:00+00'),
+    (42, 2, 'done',    '2026-04-10 12:00:00+00'),
+    (43, 1, 'running', NULL);
+
+SELECT columnar.archive_to_cold(
+    'app.run_state_hot',
+    'app.run_state_cold',
+    'run_id = 42 AND finished_at IS NOT NULL');
+```
+
 View options for all tables with:
 
 ```sql

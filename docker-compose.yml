@@ -1,6 +1,6 @@
 services:
   hydra:
-    container_name: hydra
+    container_name: datarabbit_pghydra
     image: ghcr.io/hydradatabase/hydra:latest
     ports:
       - ${POSTGRES_PORT}:5432
