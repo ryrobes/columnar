@@ -128,3 +128,14 @@ lint_acceptance:
 lint_fix_acceptance:
 	docker run --rm -v $(CURDIR)/acceptance:/app -w /app golangci/golangci-lint:$(GOLANGCI_LINT_VERSION) \
 		golangci-lint run --fix
+
+BENCH_DSN ?=
+BENCH_ARGS ?=
+
+.PHONY: bench_storage
+bench_storage:
+	python3 bench/local_storage_benchmark.py $(if $(BENCH_DSN),--dsn "$(BENCH_DSN)",) $(BENCH_ARGS)
+
+.PHONY: bench_storage_smoke
+bench_storage_smoke:
+	python3 bench/local_storage_benchmark.py $(if $(BENCH_DSN),--dsn "$(BENCH_DSN)",) --rows 50000 --query-runs 1 --append-batches 3 --append-rows 1000 $(BENCH_ARGS)

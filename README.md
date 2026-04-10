@@ -32,6 +32,12 @@ This benchmark represents typical workload in the following areas: clickstream a
 
 For our continuous benchmark results, see [BENCHMARKS](https://github.com/hydradatabase/hydra/blob/main/BENCHMARKS.md).
 
+For local layout comparisons against a running instance, use the
+synthetic harness in [bench/README.md](./bench/README.md). It compares
+`heap`, `columnar`, `hybrid_hot_cold`, and `hybrid_partitioned`
+layouts with a ClickBench-inspired query mix plus append and update
+timings.
+
 ## 🙋 FAQs
 
 View complete answers in [our documentation](https://columnar.docs.hydra.so/concepts/faqs).
@@ -42,7 +48,9 @@ A: Columnar storage, query parallelization, vectorized execution, column-level c
 
 ### Q: How do I start using the columnar format on Postgres?
 
-A: Data is loaded into columnar format by default. Use Postgres normally.
+A: Columnar is opt-in in this repo's default container setup. Use
+`USING columnar` for tables you want in columnar format, and keep
+mutable OLTP tables on `heap` by default.
 
 ### Q: What operations is Hydra meant for? Provide examples.
 
