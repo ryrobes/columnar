@@ -227,6 +227,51 @@ SELECT * FROM columnar.run_archive_policies();
 Policies are stored in `columnar.archive_policy`, and successful runs are
 logged in `columnar.archive_run_log`.
 
+### Policy-Driven Time Partitioning
+
+For range-partitioned time-series tables, the extension can also
+manage mixed-access-method partitions. The current policy layer
+supports a single `RANGE` partition key on `date`, `timestamp`, or
+`timestamptz`, and expects at least one existing partition so it can
+extend the current partition series.
+
+```sql
+CREATE TABLE app.events (
+    event_time timestamptz not null,
+    run_id bigint not null,
+    payload jsonb
+) PARTITION BY RANGE (event_time);
+
+CREATE TABLE app.events_2026_04_10
+  PARTITION OF app.events
+  FOR VALUES FROM ('2026-04-10 00:00:00+00') TO ('2026-04-11 00:00:00+00')
+  USING heap;
+
+CREATE TABLE app.events_2026_04_11
+  PARTITION OF app.events
+  FOR VALUES FROM ('2026-04-11 00:00:00+00') TO ('2026-04-12 00:00:00+00')
+  USING heap;
+
+SELECT columnar.create_partition_policy(
+    'events_daily',
+    'app.events',
+    '1 day',
+    '12 hours',
+    2);
+
+SELECT * FROM columnar.run_partition_policy(
+    'events_daily',
+    '2026-04-11 12:00:00+00');
+
+SELECT * FROM columnar.run_partition_policies();
+```
+
+In this example, partitions whose upper bound is at least `12 hours`
+older than the reference time are rewritten to columnar, and the policy
+keeps two future heap partitions ready ahead of the current partition.
+Policies are stored in `columnar.partition_policy`, and successful runs
+are logged in `columnar.partition_run_log`.
+
 ### Manual Example
 
 If you want to do the same thing by hand without the metadata layer:
@@ -257,6 +302,44 @@ SELECT columnar.archive_to_cold(
     'app.run_state_hot',
     'app.run_state_cold',
     'run_id = 42 AND finished_at IS NOT NULL');
+```
+
+For time-partitioned tables, the equivalent manual flow is to create
+new heap partitions ahead of time and convert sealed partitions one at a
+time:
+
+```sql
+CREATE TABLE app.events (
+    event_time timestamptz not null,
+    run_id bigint not null,
+    payload jsonb
+) PARTITION BY RANGE (event_time);
+
+CREATE TABLE app.events_2026_04_10
+  PARTITION OF app.events
+  FOR VALUES FROM ('2026-04-10 00:00:00+00') TO ('2026-04-11 00:00:00+00')
+  USING heap;
+
+CREATE TABLE app.events_2026_04_11
+  PARTITION OF app.events
+  FOR VALUES FROM ('2026-04-11 00:00:00+00') TO ('2026-04-12 00:00:00+00')
+  USING heap;
+
+CREATE TABLE app.events_2026_04_12
+  PARTITION OF app.events
+  FOR VALUES FROM ('2026-04-12 00:00:00+00') TO ('2026-04-13 00:00:00+00')
+  USING heap;
+
+ALTER TABLE app.events
+  DETACH PARTITION app.events_2026_04_10;
+
+SELECT columnar.alter_table_set_access_method(
+    'app.events_2026_04_10',
+    'columnar');
+
+ALTER TABLE app.events
+  ATTACH PARTITION app.events_2026_04_10
+  FOR VALUES FROM ('2026-04-10 00:00:00+00') TO ('2026-04-11 00:00:00+00');
 ```
 
 View options for all tables with:
