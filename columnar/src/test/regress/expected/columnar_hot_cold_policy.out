@@ -56,8 +56,8 @@ SELECT columnar.create_archive_policy(
 SELECT policy_name, read_view, delete_from_hot, enabled
 FROM columnar.archive_policy
 ORDER BY policy_name;
-  policy_name    |         read_view         | delete_from_hot | enabled 
------------------+---------------------------+-----------------+---------
+   policy_name    |          read_view           | delete_from_hot | enabled 
+------------------+------------------------------+-----------------+---------
  run_state_policy | hybrid_policy.run_state_read | t               | t
 (1 row)
 
@@ -94,8 +94,8 @@ SELECT COUNT(*) FROM run_state_read;
 SELECT policy_name, rows_moved, where_clause
 FROM columnar.archive_run_log
 ORDER BY id;
-  policy_name    | rows_moved | where_clause  
------------------+------------+---------------
+   policy_name    | rows_moved |  where_clause   
+------------------+------------+-----------------
  run_state_policy |          3 | run_id IN (1,3)
 (1 row)
 
@@ -113,16 +113,16 @@ SELECT columnar.create_archive_policy(
 (1 row)
 
 SELECT * FROM columnar.run_archive_policies();
-  policy_name    | rows_moved 
------------------+------------
+   policy_name    | rows_moved 
+------------------+------------
  run_state_policy |          0
 (1 row)
 
 SELECT policy_name, rows_moved, where_clause IS NULL AS empty_where_clause
 FROM columnar.archive_run_log
 ORDER BY id;
-  policy_name    | rows_moved | empty_where_clause 
------------------+------------+--------------------
+   policy_name    | rows_moved | empty_where_clause 
+------------------+------------+--------------------
  run_state_policy |          3 | f
  run_state_policy |          0 | t
 (2 rows)
@@ -133,7 +133,7 @@ SELECT columnar.create_archive_policy(
   'run_state_cold',
   'hybrid_policy.bad_selector()');
 ERROR:  selector function hybrid_policy.bad_selector must have signature (text, regclass, regclass) RETURNS text
-CONTEXT:  PL/pgSQL function columnar.create_archive_policy(text,regclass,regclass,regprocedure,text,boolean,boolean) line 56 at RAISE
+CONTEXT:  PL/pgSQL function columnar.create_archive_policy(text,regclass,regclass,regprocedure,text,boolean,boolean) line 46 at RAISE
 SELECT columnar.drop_archive_policy('disabled_policy');
  drop_archive_policy 
 ---------------------
