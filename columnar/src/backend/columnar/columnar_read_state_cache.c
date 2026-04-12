@@ -67,10 +67,13 @@ typedef struct ColumnarReadStateMapEntry
  * leaked reference can cause memory issues.
  */
 static MemoryContextCallback cleanupCallback;
+extern void ResetFetchRowVersionState(void);
+
 static void CleanupColumnarReadStateMap(void *arg)
 {
 	ColumnarReadStateMap = NULL;
 	ColumnarReadStateContext = NULL;
+	ResetFetchRowVersionState();
 }
 
 ColumnarReadState **

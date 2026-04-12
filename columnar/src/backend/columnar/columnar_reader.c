@@ -1947,6 +1947,7 @@ DeserializeChunkData(StripeBuffers *stripeBuffers, uint64 chunkIndex,
 			DeserializeBoolArray(chunkBuffers->existsBuffer,
 								 chunkData->existsArray[columnIndex],
 								 rowCount);
+
 			DeserializeDatumArray(valueBuffer, chunkData->existsArray[columnIndex],
 								  rowCount, attributeForm->attbyval,
 								  attributeForm->attlen, attributeForm->attalign,

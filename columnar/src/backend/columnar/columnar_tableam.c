@@ -99,6 +99,10 @@ typedef struct ColumnarScanDescData
 
 	/* Vectorization */
 	bool returnVectorizedTuple;
+
+	/* ANALYZE state */
+	bool analyzeDone;
+	BlockNumber analyzeBlocksLeft;
 } ColumnarScanDescData;
 
 
@@ -803,6 +807,12 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *sscan,
 }
 
 
+void
+ResetFetchRowVersionState(void)
+{
+	/* no-op — kept for callback compatibility */
+}
+
 static bool
 columnar_fetch_row_version(Relation relation,
 						   ItemPointer tid,
@@ -810,54 +820,60 @@ columnar_fetch_row_version(Relation relation,
 						   TupleTableSlot *slot)
 {
 	uint64 rowNumber = tid_to_row_number(*tid);
-	ColumnarReadState **readState =
-		FindReadStateCache(relation, GetCurrentSubTransactionId());
 
-	if (readState == NULL)
+	/*
+	 * Use the same approach as index_fetch_tuple: create a read state,
+	 * read the row, build a HeapTuple to copy the data, then clean up.
+	 * We use randomAccess=true and project all columns.
+	 */
+	int natts = relation->rd_att->natts;
+	Bitmapset *attr_needed = bms_add_range(NULL, 0, natts - 1);
+
+	ColumnarReadState *readState =
+		init_columnar_read_state(relation,
+								 RelationGetDescr(relation),
+								 attr_needed, NIL,
+								 slot->tts_mcxt,
+								 GetTransactionSnapshot(), true,
+								 NULL);
+
+	ColumnarReadFlushPendingWrites(readState);
+
+	/* Zero values array before reading to detect unfilled columns */
+	memset(slot->tts_values, 0, natts * sizeof(Datum));
+	memset(slot->tts_isnull, true, natts * sizeof(bool));
+
+	ColumnarReadRowByRowNumber(readState, rowNumber,
+							   slot->tts_values, slot->tts_isnull);
+
+	/*
+	 * Safety: if the reader marked a varlena column as not-null but left
+	 * the datum as a zero/NULL pointer, force it to null.  This can happen
+	 * if the deserialization didn't fill all column values.
+	 */
+	TupleDesc tupdesc = RelationGetDescr(relation);
+	for (int i = 0; i < natts; i++)
 	{
-		readState = InitColumnarReadStateCache(relation, GetCurrentSubTransactionId());
-
-		int natts = relation->rd_att->natts;
-		Bitmapset *attr_needed = bms_add_range(NULL, 0, natts - 1);
-
-		List *scanQual = NIL;
-
-		bool randomAccess = true;
-
-		*readState = init_columnar_read_state(relation,
-											  slot->tts_tupleDescriptor,
-											  attr_needed, scanQual,
-											  GetColumnarReadStateCache(),
-											  snapshot, randomAccess,
-											  NULL);
+		if (!slot->tts_isnull[i] && !TupleDescAttr(tupdesc, i)->attbyval &&
+			DatumGetPointer(slot->tts_values[i]) == NULL)
+		{
+			slot->tts_isnull[i] = true;
+		}
 	}
 
 	/*
-	 * Flush pending writes so in-memory data is readable from storage.
-	 * Without this, reads return zero values for unflushed stripes.
+	 * Build a HeapTuple from the reader's values.  heap_form_tuple copies
+	 * all pass-by-reference data, so the tuple is self-contained and safe
+	 * to use after we free the read state.
 	 */
-	ColumnarReadFlushPendingWrites(*readState);
-	MemoryContext oldContext = MemoryContextSwitchTo(GetColumnarReadStateCache());
-	ColumnarReadRowByRowNumber(*readState, rowNumber,
-							   slot->tts_values, slot->tts_isnull);
-	MemoryContextSwitchTo(oldContext);
-	elog(NOTICE, "columnar_fetch_row_version: read complete, isnull[0]=%d isnull[1]=%d isnull[2]=%d",
-		 slot->tts_isnull[0], slot->tts_isnull[1], slot->tts_isnull[2]);
+	HeapTuple htup = heap_form_tuple(tupdesc,
+									 slot->tts_values, slot->tts_isnull);
+	htup->t_tableOid = RelationGetRelid(relation);
 
-	slot->tts_tableOid = RelationGetRelid(relation);
+	ColumnarEndRead(readState);
+
+	ExecForceStoreHeapTuple(htup, slot, true);
 	slot->tts_tid = *tid;
-
-	if (TTS_EMPTY(slot))
-		ExecStoreVirtualTuple(slot);
-
-	/*
-	 * Materialize the slot to copy pass-by-reference values into stable
-	 * memory.  The columnar reader stores varlena datums as pointers into
-	 * chunk data buffers that may be freed on the next read operation.
-	 * The executor (particularly PG18's ExecUpdatePrologue) may
-	 * materialize the slot later — by then the pointers could be stale.
-	 */
-	ExecMaterializeSlot(slot);
 
 	return true;
 }
@@ -2208,11 +2224,40 @@ ConditionalLockRelationWithTimeout(Relation rel, LOCKMODE lockMode, int timeout,
 #if PG_VERSION_NUM >= PG_VERSION_17
 static bool
 columnar_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
+{
+	/*
+	 * Columnar storage is not page-based.  For ANALYZE, we need to provide
+	 * enough "virtual blocks" that the sampling algorithm collects a
+	 * representative sample.  Use the total row count (capped at a
+	 * reasonable maximum) so each virtual block yields one tuple from
+	 * scan_analyze_next_tuple.  The tuple callback will return false
+	 * when all rows are exhausted.
+	 */
+	ColumnarScanDesc cscan = (ColumnarScanDesc) scan;
+	if (!cscan->analyzeDone)
+	{
+		cscan->analyzeDone = true;
+		/*
+		 * Use a block count large enough to give ANALYZE a representative
+		 * sample.  The physical block count is small (compressed), so use
+		 * the maximum of physical blocks and 1000 to ensure the sampling
+		 * algorithm collects enough rows for reliable n_distinct estimates.
+		 */
+		BlockNumber nblocks =
+			smgrnblocks(RelationGetSmgr(scan->rs_rd), MAIN_FORKNUM);
+		cscan->analyzeBlocksLeft = Max(nblocks, 1000);
+	}
+	if (cscan->analyzeBlocksLeft > 0)
+	{
+		cscan->analyzeBlocksLeft--;
+		return true;
+	}
+	return false;
+}
 #else
 static bool
 columnar_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 								 BufferAccessStrategy bstrategy)
-#endif
 {
 	/*
 	 * Our access method is not pages based, i.e. tuples are not confined
@@ -2222,6 +2267,7 @@ columnar_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 	 */
 	return true;
 }
+#endif
 
 
 static bool
@@ -2253,6 +2299,15 @@ columnar_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 
 		return true;
 	}
+
+	/*
+	 * Scan exhausted.  Set *liverows to the actual total row count so
+	 * that ANALYZE's statistics computation uses the correct population
+	 * size.  Without this, on PG17+ the block-based sampling produces
+	 * liverows = sampled_rows instead of total_rows, which makes
+	 * n_distinct estimation degenerate.
+	 */
+	*liverows = (double) ColumnarTableRowCount(scan->rs_rd);
 
 	/* Reset cache to previous state. */
 	columnar_enable_page_cache = old_cache_mode;
@@ -2732,18 +2787,37 @@ columnar_estimate_rel_size(Relation rel, int32 *attr_widths,
 						   BlockNumber *pages, double *tuples,
 						   double *allvisfrac)
 {
-	(void) RelationGetSmgr(rel);
+	get_rel_data_width(rel, attr_widths);
 
-	*pages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 	*tuples = ColumnarTableRowCount(rel);
 
 	/*
-	 * Append-only, so everything is visible except in-progress or rolled-back
-	 * transactions.
+	 * Report a logical page count proportional to the uncompressed data
+	 * volume.  The physical block count is tiny due to columnar compression,
+	 * but the planner and ANALYZE need a page count that reflects the
+	 * actual data volume for proper cost estimation and sampling.
 	 */
-	*allvisfrac = 1.0;
+	if (*tuples > 0)
+	{
+		int32 avg_width = 0;
+		int natts = RelationGetNumberOfAttributes(rel);
+		for (int i = 0; i < natts; i++)
+		{
+			if (attr_widths[i] > 0)
+				avg_width += attr_widths[i];
+			else
+				avg_width += 8;  /* conservative default */
+		}
+		/* tuple overhead: ~24 bytes for heap-equivalent */
+		double logical_bytes = *tuples * (avg_width + 24);
+		*pages = (BlockNumber) Max(1, ceil(logical_bytes / BLCKSZ));
+	}
+	else
+	{
+		*pages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
+	}
 
-	get_rel_data_width(rel, attr_widths);
+	*allvisfrac = 1.0;
 }
 
 

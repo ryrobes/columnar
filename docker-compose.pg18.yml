@@ -5,11 +5,12 @@ services:
       dockerfile: Dockerfile.pg18
     container_name: columnar_pg18
     ports:
-      - "5418:5432"
+      - "5432:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: testdb
+      POSTGRES_DB: postgres
+      COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD: columnar
     volumes:
       - columnar_pg18_data:/var/lib/postgresql
 
