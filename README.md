@@ -71,7 +71,7 @@ fork makes `UPDATE`/`DELETE` substantially more usable:
    - Stale cached read state with narrow projection
    - Missing `ColumnarReadFlushPendingWrites()` call
    - Dangling varlena pointers into chunk data buffers
-   
+
    Fixed by always projecting all columns, using
    `GetTransactionSnapshot()`, flushing pending writes, and copying the
    result into a self-contained `HeapTuple` via `heap_form_tuple` +
@@ -136,7 +136,7 @@ Added `columnar_dml_improvements.sql` covering the DML fixes:
 ## 🚀 Run Locally
 
 ```bash
-git clone <this-fork> && cd columnar
+git clone https://github.com/ryrobes/columnar && cd columnar
 docker compose -f docker-compose.pg18.yml up -d --build
 psql postgresql://postgres:postgres@127.0.0.1:5432/postgres
 ```
