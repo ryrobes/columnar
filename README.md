@@ -135,45 +135,171 @@ Added `columnar_dml_improvements.sql` covering the DML fixes:
 
 ## 🚀 Run Locally
 
+### From the repo (dev workflow)
+
 ```bash
 git clone https://github.com/ryrobes/columnar && cd columnar
 docker compose -f docker-compose.pg18.yml up -d --build
 psql postgresql://postgres:postgres@127.0.0.1:5432/postgres
 ```
 
+### As a standalone image (no repo needed)
+
+Once you've built and pushed the image to a registry, anyone (including
+yourself on another machine) can run it with a single `docker run`:
+
+```bash
+docker run -d --name columnar-pg18 \
+  -p 5432:5432 \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=postgres \
+  -e COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD=columnar \
+  -v columnar_pg18_data:/var/lib/postgresql \
+  ryrobes/hydra-columnar-pg18:latest
+
+psql postgresql://postgres:postgres@127.0.0.1:5432/postgres
+```
+
 By default, `CREATE TABLE foo(...)` creates a columnar table. Use
-`USING heap` for row-store tables.
+`USING heap` for row-store tables. `CREATE EXTENSION vector` is also
+already installed.
+
+### 📦 Build & Publish Your Own Image
+
+The `Makefile` has one-shot targets for the whole build/publish/run
+cycle so you don't have to remember `docker build` flags:
+
+```bash
+# Build locally (tags as ryrobes/hydra-columnar-pg18:latest + :pg18)
+make image_build
+
+# Run the built image (no compose, no repo context needed)
+make image_run
+
+# Push to your registry (set IMAGE_REPO to your own)
+make image_push IMAGE_REPO=yourname/hydra-columnar-pg18
+
+# Multi-arch build (amd64 + arm64, pushes directly)
+make image_build_multiarch IMAGE_REPO=yourname/hydra-columnar-pg18
+
+# Clean up
+make image_stop
+```
+
+To push to GitHub Container Registry instead of Docker Hub:
+
+```bash
+echo $GHCR_PAT | docker login ghcr.io -u yourname --password-stdin
+make image_push IMAGE_REPO=ghcr.io/yourname/hydra-columnar-pg18
+```
+
+The resulting image is ~500 MB, self-contained, and includes:
+- PostgreSQL 18.3
+- columnar extension (this fork)
+- pgvector 0.8.2
+- auto-init: creates both extensions and sets
+  `default_table_access_method = columnar` on first startup
 
 ## 💪 Benchmark Results
 
-Against vanilla PG15, PG18, and AlloyDB on a 1.4M-row analytic dataset
-(Dec 2026):
+**25 million rows, 5 query runs each**, against vanilla PG15, vanilla
+PG18, AlloyDB, and the original Hydra PG14 columnar extension. Medians
+in milliseconds, smaller is better. Asterisks (\*) mark this fork.
 
-| metric | heap | columnar | vanilla15 | vanilla18 | alloydb |
-|---|---|---|---|---|---|
-| total_size_mb | 1260 | **76** | 1260 | 1260 | 1265 |
-| count_all (ms) | 136 | **12** | 169 | 143 | 109 |
-| distinct_users (ms) | 434 | **146** | 547 | 453 | 523 |
-| filtered_count (ms) | 176 | **26** | 210 | 174 | 190 |
-| hot_work_slice (ms) | 97 | **7** | 118 | 88 | 95 |
-| latency_rollup (ms) | 188 | **39** | 214 | 179 | 198 |
-| recent_window (ms) | 93 | **9** | 123 | 102 | 100 |
-| region_day_rollup (ms) | 335 | **7** | 364 | 321 | 307 |
-| search_phrase_topn (ms) | 207 | **70** | 243 | 204 | 220 |
-| service_topn (ms) | 266 | **7** | 313 | 272 | 250 |
-| tenant_error_rollup (ms) | 344 | **8** | 392 | 347 | 329 |
-| url_like (ms) | 293 | **71** | 314 | 282 | 255 |
-| wide_sum (ms) | 349 | **117** | 384 | 352 | 338 |
+Reproduce:
+```bash
+make bench_storage BENCH_ARGS="--rows 25000000 --query-runs 5 \
+  --compare vanilla_pg15=postgresql://postgres:postgres@localhost:5415/postgres \
+  --compare vanilla_pg18=postgresql://postgres:postgres@localhost:5418/postgres \
+  --compare alloydb=postgresql://postgres:postgres@localhost:5434/postgres \
+  --compare older_hydra_pg14=postgresql://postgres:postgres@localhost:5499/postgres \
+  --output tmp/bench.json"
+```
 
-Columnar wins on all 12 analytic queries, often 5-50x faster, and uses
-~16x less disk space thanks to compression.
+### Storage & Write Path
 
-Update latency is still higher than heap (columnar uses delete+insert
-semantics), so heap remains the right choice for high-frequency OLTP
-mutation patterns. But for general-purpose tables, columnar is now a
-viable default.
+| metric              | hydra18_heap\* | hydra18_columnar\* | vanilla_pg15 | vanilla_pg18 | alloydb | older_hydra_pg14 |
+|---------------------|---------------:|-------------------:|-------------:|-------------:|--------:|-----------------:|
+| total_size_mb       | 6303.5         | **381.5**          | 6303.5       | 6303.5       | 6330.5  | 381.5            |
+| load_seconds        | 47.7           | 62.8               | 58.6         | 56.2         | 62.7    | 64.5             |
+| append_seconds      | 0.68           | 0.29               | 0.19         | 0.22         | 0.54    | 0.32             |
+| update_seconds      | 0.86           | 9.48               | 1.39         | 0.89         | 1.38    | 0.16             |
 
-For the full ClickBench benchmark from the upstream project, see
+Both columnar variants (ours on PG18, upstream on PG14) hit the same
+**381 MB** footprint vs ~6300 MB for row storage — a **~16.5x
+compression ratio**.
+
+**About those update numbers.** Upstream's 0.16s update time on PG14
+looks impressive but is misleading. The old implementation:
+
+- Held a **table-wide advisory lock** for every UPDATE, serializing all
+  concurrent writers on the same relation.
+- Tombstoned the old row (flipped a bit in the row mask, inserted a
+  new row) without fetching the old tuple's full column values, which
+  worked on PG14's simpler executor but **crashes on PG18** — PG18's
+  `ExecUpdate` calls `table_tuple_fetch_row_version` to materialize old
+  column values for the new tuple projection, and the upstream
+  implementation returned dangling varlena pointers into chunk data
+  buffers.
+- Produced incorrect `reltuples` because deleted rows weren't
+  subtracted, distorting planner estimates.
+
+Our 9.5s update is slower per-row but is actually **correct and
+concurrency-safe on PG18**:
+
+- Stripe-level advisory locking — concurrent UPDATEs to different
+  stripes no longer block each other.
+- `columnar_fetch_row_version` fetches a consistent full old tuple via
+  `heap_form_tuple` + `ExecForceStoreHeapTuple` — no more use-after-free
+  on varlena data.
+- Correct `ColumnarTableTupleCount` so `VACUUM` writes accurate
+  `pg_class.reltuples`.
+
+So: upstream was faster because it was cutting corners that only held
+together on older PostgreSQL versions. On PG18 it crashes outright.
+There's still headroom on the per-row cost (the `HeapTuple` roundtrip
+per fetched row is expensive), but "fast but broken" wasn't a viable
+baseline to preserve.
+
+### Analytic Query Performance (medians, ms)
+
+| query               | hydra18_heap\* | hydra18_columnar\* | vanilla_pg15 | vanilla_pg18 | alloydb  | older_hydra_pg14 |
+|---------------------|---------------:|-------------------:|-------------:|-------------:|---------:|-----------------:|
+| count_all           | 656            | **42**             | 842          | 673          | 537      | 46               |
+| distinct_users      | 1136           | **811**            | 2799         | 1113         | 1115     | 747              |
+| filtered_count      | 869            | **112**            | 1051         | 845          | 960      | 130              |
+| hot_work_slice      | 401            | **10**             | 578          | 421          | 458      | 11               |
+| latency_rollup      | 893            | **178**            | 1064         | 885          | 990      | 244              |
+| recent_window       | 428            | **12**             | 603          | 461          | 480      | 13               |
+| region_day_rollup   | 1653           | **495**            | 1834         | 1669         | 1568     | 502              |
+| search_phrase_topn  | 943            | **225**            | 1135         | 974          | 960      | 218              |
+| service_topn        | 1319           | **419**            | 1561         | 1354         | 1244     | 455              |
+| tenant_error_rollup | 1671           | **528**            | 1935         | 1675         | 1646     | 532              |
+| url_like            | 1460           | **296**            | 1573         | 1414         | 1269     | 291              |
+| wide_sum            | 1673           | **527**            | 1917         | 1743         | 1694     | 517              |
+
+Columnar wins every single analytic query, typically **3-40x faster**
+than heap / vanilla PG / AlloyDB. Our PG18 port and the original
+Hydra PG14 columnar perform within a few percent of each other on
+reads — confirming we haven't regressed anything while making DML
+work correctly on PG18.
+
+### Takeaways
+
+- **OLAP**: columnar is dramatically faster *and* uses ~16x less disk.
+- **OLTP point updates**: heap is still the right choice — columnar's
+  delete+insert semantics mean single-row UPDATEs will always be
+  slower than heap's in-place updates.
+- **Correctness vs. shortcuts**: upstream's fast updates only worked
+  because they skipped work that PG17+ requires. Our port trades some
+  per-row UPDATE speed for actually-correct, crash-free, concurrently-
+  safe DML on modern PostgreSQL. Reads are within a few percent of
+  upstream, so if you're on PG14 today the reasons to move are
+  PG18 support, safe concurrent writes, correct planner stats, and
+  no table-level advisory lock on DML.
+
+For the upstream ClickBench results, see
 [BENCHMARKS](https://github.com/hydradatabase/hydra/blob/main/BENCHMARKS.md).
 
 ## 🙋 FAQs

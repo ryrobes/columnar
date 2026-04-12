@@ -139,3 +139,49 @@ bench_storage:
 .PHONY: bench_storage_smoke
 bench_storage_smoke:
 	python3 bench/local_storage_benchmark.py --dsn "$(BENCH_DSN)" --rows 50000 --query-runs 1 --append-batches 3 --append-rows 1000 $(BENCH_ARGS)
+
+##
+## Distribution image — a self-contained PG18 + columnar + pgvector image
+## that can be pushed to a registry and run without this repo.
+##
+
+# Override these if you want to push to your own registry
+IMAGE_REPO ?= ryrobes/hydra-columnar-pg18
+IMAGE_TAG  ?= latest
+IMAGE      := $(IMAGE_REPO):$(IMAGE_TAG)
+
+.PHONY: image_build
+# Build the standalone distribution image.
+image_build:
+	docker build -f Dockerfile.pg18 -t $(IMAGE) -t $(IMAGE_REPO):pg18 .
+
+.PHONY: image_build_multiarch
+# Build for linux/amd64 and linux/arm64 via buildx (requires `docker buildx create --use` once).
+image_build_multiarch:
+	docker buildx build -f Dockerfile.pg18 \
+		--platform linux/amd64,linux/arm64 \
+		-t $(IMAGE) -t $(IMAGE_REPO):pg18 \
+		--push .
+
+.PHONY: image_push
+# Push the locally-built image to the configured registry.
+image_push:
+	docker push $(IMAGE)
+	docker push $(IMAGE_REPO):pg18
+
+.PHONY: image_run
+# Run the image locally (no repo needed once the image is built/pulled).
+image_run:
+	docker run -d --name columnar-pg18 \
+		-p 5432:5432 \
+		-e POSTGRES_USER=postgres \
+		-e POSTGRES_PASSWORD=postgres \
+		-e POSTGRES_DB=postgres \
+		-e COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD=columnar \
+		-v columnar_pg18_data:/var/lib/postgresql \
+		$(IMAGE)
+
+.PHONY: image_stop
+image_stop:
+	-docker stop columnar-pg18
+	-docker rm columnar-pg18
