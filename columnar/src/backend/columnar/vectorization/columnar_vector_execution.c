@@ -98,9 +98,13 @@ GetVectorizedProcedureOid(Oid procedureOid, Oid *vectorizedProcedureOid)
 	Oid *true_oid_array;
 
 	procedureTuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(procedureOid));
+	if (!HeapTupleIsValid(procedureTuple))
+		return false;
+
 	procedureForm = (Form_pg_proc) GETSTRUCT(procedureTuple);
 
 	int originalProcedureNameLen = strlen(NameStr(procedureForm->proname));
+	int pronargs = procedureForm->pronargs;
 
 	char * vectorizedProcedureName =
 		palloc0(sizeof(char) * originalProcedureNameLen + 2);
@@ -110,19 +114,19 @@ GetVectorizedProcedureOid(Oid procedureOid, Oid *vectorizedProcedureOid)
 	memcpy(vectorizedProcedureName + 1,
 		NameStr(procedureForm->proname),
 		originalProcedureNameLen);
-	
+
+	argtypes = palloc(sizeof(Oid) * pronargs);
+
+	for (i = 0; i < pronargs; i++)
+		argtypes[i] = procedureForm->proargtypes.values[i];
+
 	ReleaseSysCache(procedureTuple);
 
 	funcNames = lappend(funcNames, makeString(vectorizedProcedureName));
-
-	argtypes = palloc(sizeof(Oid) * procedureForm->pronargs);
-
-	for (i = 0; i < procedureForm->pronargs; i++)
-		argtypes[i] = procedureForm->proargtypes.values[i];
 	
 #if PG_VERSION_NUM >= PG_VERSION_14
 	fdResult = func_get_detail(funcNames, NIL, NIL,
-								procedureForm->pronargs, argtypes,
+								pronargs, argtypes,
 								false, true, false,
 								vectorizedProcedureOid,
 								&retype, &retset,
@@ -131,7 +135,7 @@ GetVectorizedProcedureOid(Oid procedureOid, Oid *vectorizedProcedureOid)
 #else
 	fdResult = func_get_detail(funcNames,
 								NIL, NIL,
-								procedureForm->pronargs, argtypes,
+								pronargs, argtypes,
 								false, false,
 								vectorizedProcedureOid, &retype,
 								&retset, &nvargs, &vatype,
@@ -140,8 +144,9 @@ GetVectorizedProcedureOid(Oid procedureOid, Oid *vectorizedProcedureOid)
 
 	if ((fdResult == FUNCDETAIL_NOTFOUND || fdResult == FUNCDETAIL_MULTIPLE) || 
 		!OidIsValid(*vectorizedProcedureOid) ||
-		(procedureForm->pronargs != 0 && 
-		 memcmp(argtypes, true_oid_array, procedureForm->pronargs * sizeof(Oid)) != 0))
+		(pronargs != 0 &&
+		 (true_oid_array == NULL ||
+		  memcmp(argtypes, true_oid_array, pronargs * sizeof(Oid)) != 0)))
 	{
 		return false;
 	}

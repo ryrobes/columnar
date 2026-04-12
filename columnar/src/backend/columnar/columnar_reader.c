@@ -616,6 +616,29 @@ ReadStripeRowByRowNumber(ColumnarReadState *readState,
 		{
 			stripeReadState->chunkGroupReadState->rowMask = NULL;
 		}
+
+	}
+	else if (columnar_enable_dml)
+	{
+#if PG_VERSION_NUM >= PG_VERSION_16
+		RowMaskWriteStateEntry *rowMaskEntry =
+			RowMaskFindWriteState(stripeReadState->relation->rd_locator.relNumber,
+								  GetCurrentSubTransactionId(), rowNumber);
+#else
+		RowMaskWriteStateEntry *rowMaskEntry =
+			RowMaskFindWriteState(stripeReadState->relation->rd_node.relNode,
+								  GetCurrentSubTransactionId(), rowNumber);
+#endif
+		if (rowMaskEntry != NULL &&
+			stripeReadState->chunkGroupReadState->rowMask != rowMaskEntry->mask)
+		{
+			if (stripeReadState->chunkGroupReadState->rowMask != NULL &&
+				!stripeReadState->chunkGroupReadState->rowMaskCached)
+				pfree(stripeReadState->chunkGroupReadState->rowMask);
+
+			stripeReadState->chunkGroupReadState->rowMask = rowMaskEntry->mask;
+			stripeReadState->chunkGroupReadState->rowMaskCached = true;
+		}
 	}
 
 	return ReadChunkGroupRowByRowOffset(stripeReadState->chunkGroupReadState,
@@ -2272,6 +2295,10 @@ ReadChunkGroupNextVector(ChunkGroupReadState *chunkGroupReadState, Datum *column
 				}
 
 				vectorColumn->isnull[vectorColumn->dimension] = false;
+			}
+			else
+			{
+				vectorColumn->hasNulls = true;
 			}
 
 			vectorColumn->dimension++;

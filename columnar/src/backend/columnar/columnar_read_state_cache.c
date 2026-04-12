@@ -213,7 +213,8 @@ CleanupReadStateCache(SubTransactionId currentSubXid)
 		SubXidWriteState *stackHead = entry->writeStateStack;
 		if (stackHead->subXid == currentSubXid)
 		{
-			ColumnarEndRead(stackHead->readState);
+			if (stackHead->readState != NULL)
+				ColumnarEndRead(stackHead->readState);
 			entry->writeStateStack = stackHead->next;
 		}
 	}

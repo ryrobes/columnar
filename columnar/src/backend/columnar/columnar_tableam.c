@@ -798,10 +798,7 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *sscan,
 	 * The columnar reader stores pass-by-ref datums as pointers into chunk
 	 * data buffers that may be freed on the next read.
 	 */
-	elog(NOTICE, "columnar_fetch_row_version: before materialize, isnull[0]=%d isnull[1]=%d isnull[2]=%d",
-		 slot->tts_isnull[0], slot->tts_isnull[1], slot->tts_isnull[2]);
 	ExecMaterializeSlot(slot);
-	elog(NOTICE, "columnar_fetch_row_version: after materialize OK");
 
 	return true;
 }
@@ -820,6 +817,26 @@ columnar_fetch_row_version(Relation relation,
 						   TupleTableSlot *slot)
 {
 	uint64 rowNumber = tid_to_row_number(*tid);
+	bool shouldFlushPendingWrites = true;
+	bool useCachedReadState = false;
+	ColumnarReadState *readState = NULL;
+
+	/*
+	 * Fetching an old row version during UPDATE should not force pending
+	 * appended rows out as tiny stripes. Only flush if the requested row might
+	 * live in an in-progress stripe.
+	 */
+	StripeMetadata *stripeMetadata = FindStripeByRowNumber(relation, rowNumber,
+														   GetTransactionSnapshot());
+	if (stripeMetadata != NULL)
+	{
+		if (StripeWriteState(stripeMetadata) == STRIPE_WRITE_FLUSHED)
+		{
+			shouldFlushPendingWrites = false;
+		}
+
+		pfree(stripeMetadata);
+	}
 
 	/*
 	 * Use the same approach as index_fetch_tuple: create a read state,
@@ -827,24 +844,66 @@ columnar_fetch_row_version(Relation relation,
 	 * We use randomAccess=true and project all columns.
 	 */
 	int natts = relation->rd_att->natts;
-	Bitmapset *attr_needed = bms_add_range(NULL, 0, natts - 1);
 
-	ColumnarReadState *readState =
-		init_columnar_read_state(relation,
-								 RelationGetDescr(relation),
-								 attr_needed, NIL,
-								 slot->tts_mcxt,
-								 GetTransactionSnapshot(), true,
-								 NULL);
+	if (!shouldFlushPendingWrites)
+	{
+		ColumnarReadState **cachedReadState =
+			InitColumnarReadStateCache(relation, GetCurrentSubTransactionId());
 
-	ColumnarReadFlushPendingWrites(readState);
+		readState = *cachedReadState;
+		if (readState == NULL)
+		{
+			MemoryContext cacheContext = GetColumnarReadStateCache();
+			MemoryContext oldContext = MemoryContextSwitchTo(cacheContext);
+			Bitmapset *attr_needed = bms_add_range(NULL, 0, natts - 1);
+
+			readState = init_columnar_read_state(relation,
+												 RelationGetDescr(relation),
+												 attr_needed, NIL,
+												 cacheContext,
+												 GetTransactionSnapshot(), true,
+												 NULL);
+			*cachedReadState = readState;
+
+			MemoryContextSwitchTo(oldContext);
+		}
+
+		useCachedReadState = true;
+	}
+	else
+	{
+		Bitmapset *attr_needed = bms_add_range(NULL, 0, natts - 1);
+
+		readState = init_columnar_read_state(relation,
+											 RelationGetDescr(relation),
+											 attr_needed, NIL,
+											 slot->tts_mcxt,
+											 GetTransactionSnapshot(), true,
+											 NULL);
+		ColumnarReadFlushPendingWrites(readState);
+	}
+
+	Assert(readState != NULL);
 
 	/* Zero values array before reading to detect unfilled columns */
 	memset(slot->tts_values, 0, natts * sizeof(Datum));
 	memset(slot->tts_isnull, true, natts * sizeof(bool));
 
-	ColumnarReadRowByRowNumber(readState, rowNumber,
-							   slot->tts_values, slot->tts_isnull);
+	if (useCachedReadState)
+	{
+		MemoryContext cacheContext = GetColumnarReadStateCache();
+		MemoryContext oldContext = MemoryContextSwitchTo(cacheContext);
+
+		ColumnarReadRowByRowNumber(readState, rowNumber,
+								   slot->tts_values, slot->tts_isnull);
+
+		MemoryContextSwitchTo(oldContext);
+	}
+	else
+	{
+		ColumnarReadRowByRowNumber(readState, rowNumber,
+								   slot->tts_values, slot->tts_isnull);
+	}
 
 	/*
 	 * Safety: if the reader marked a varlena column as not-null but left
@@ -870,7 +929,8 @@ columnar_fetch_row_version(Relation relation,
 									 slot->tts_values, slot->tts_isnull);
 	htup->t_tableOid = RelationGetRelid(relation);
 
-	ColumnarEndRead(readState);
+	if (!useCachedReadState)
+		ColumnarEndRead(readState);
 
 	ExecForceStoreHeapTuple(htup, slot, true);
 	slot->tts_tid = *tid;
@@ -1219,6 +1279,7 @@ columnar_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 	DirectFunctionCall1(pg_advisory_xact_lock_int8,
 						Int64GetDatum(columnar_stripe_lock_key(storageId,
 															   stripeMetadata->id)));
+	pfree(stripeMetadata);
 
 #if PG_VERSION_NUM >= PG_VERSION_16
 	if (!UpdateRowMask(relation->rd_locator, storageId, GetTransactionSnapshot(), rowNumber))
@@ -1264,6 +1325,7 @@ columnar_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	DirectFunctionCall1(pg_advisory_xact_lock_int8,
 						Int64GetDatum(columnar_stripe_lock_key(storageId,
 															   stripeMetadata->id)));
+	pfree(stripeMetadata);
 
 #if PG_VERSION_NUM >= PG_VERSION_16
 	if (!UpdateRowMask(relation->rd_locator, storageId, GetTransactionSnapshot(), rowNumber))
@@ -1620,6 +1682,7 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 	ListCell *lc = NULL;
 
 	uint32 lastStripeDeletedRows = 0;
+	bool candidateHasDeletedRows = false;
 
 	Size totalDecompressedStripeLength = 0;
 
@@ -1654,6 +1717,9 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 
 		totalRowNumberCount += stripeRowCount;
 		startingStripeListPosition++;
+
+		if (lastStripeDeletedRows > 0)
+			candidateHasDeletedRows = true;
 	}
 
 	/*
@@ -1665,10 +1731,21 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 	}
 
 	/*
+	 * Row-mask-aware stripe compaction needs stronger correctness guarantees
+	 * before it can safely replace old metadata. Keep ordinary VACUUM
+	 * conservative for DML-deleted stripes; it will still update reltuples
+	 * below and can still truncate unused storage.
+	 */
+	if (candidateHasDeletedRows)
+	{
+		return false;
+	}
+
+	/*
 	 * There is only one stripe that is candidate. Maybe we should vacuum
 	 * it if condition is met.
 	 */
-	else if (startingStripeListPosition == 1)
+	if (startingStripeListPosition == 1)
 	{
 		/* Maybe we should vacuum only one stripe if count of
 		 * deleted rows is higher than 20 percent.

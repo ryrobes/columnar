@@ -30,6 +30,9 @@ vanycount(PG_FUNCTION_ARGS)
 	VectorColumn *arg1 = (VectorColumn *) PG_GETARG_POINTER(1);
 	int i;
 
+	if (!arg1->hasNulls)
+		PG_RETURN_INT64(result + arg1->dimension);
+
 	for (i = 0; i <  arg1->dimension; i++) 
 	{
 		if (arg1->isnull[i])
@@ -53,10 +56,18 @@ vint2sum(PG_FUNCTION_ARGS)
 
 	int16 *vectorValue = (int16*) arg1->value;
 
-	for (i = 0; i < arg1->dimension; i++)
+	if (!arg1->hasNulls)
 	{
-		if (!arg1->isnull[i])
+		for (i = 0; i < arg1->dimension; i++)
 			sumX += (int64) vectorValue[i];
+	}
+	else
+	{
+		for (i = 0; i < arg1->dimension; i++)
+		{
+			if (!arg1->isnull[i])
+				sumX += (int64) vectorValue[i];
+		}
 	}
 
 	PG_RETURN_INT64(sumX);
@@ -85,12 +96,21 @@ vint2acc(PG_FUNCTION_ARGS)
 
 	int16 *vectorValue = (int16*) arg1->value;
 
-	for (i = 0; i < arg1->dimension; i++)
+	if (!arg1->hasNulls)
 	{
-		if (!arg1->isnull[i])
-		{
-			transdata->N++;
+		transdata->N += arg1->dimension;
+		for (i = 0; i < arg1->dimension; i++)
 			transdata->sumX += (int64) vectorValue[i];
+	}
+	else
+	{
+		for (i = 0; i < arg1->dimension; i++)
+		{
+			if (!arg1->isnull[i])
+			{
+				transdata->N++;
+				transdata->sumX += (int64) vectorValue[i];
+			}
 		}
 	}
 
@@ -155,10 +175,18 @@ vint4sum(PG_FUNCTION_ARGS)
 
 	int32 *vectorValue = (int32*) arg1->value;
 
-	for (i = 0; i < arg1->dimension; i++)
+	if (!arg1->hasNulls)
 	{
-		if (!arg1->isnull[i])
+		for (i = 0; i < arg1->dimension; i++)
 			sumX += (int64) vectorValue[i];
+	}
+	else
+	{
+		for (i = 0; i < arg1->dimension; i++)
+		{
+			if (!arg1->isnull[i])
+				sumX += (int64) vectorValue[i];
+		}
 	}
 
 	PG_RETURN_INT64(sumX);
@@ -187,12 +215,21 @@ vint4acc(PG_FUNCTION_ARGS)
 
 	int32 *vectorValue = (int32*) arg1->value;
 
-	for (i = 0; i < arg1->dimension; i++)
+	if (!arg1->hasNulls)
 	{
-		if (!arg1->isnull[i])
-		{
-			transdata->N++;
+		transdata->N += arg1->dimension;
+		for (i = 0; i < arg1->dimension; i++)
 			transdata->sumX += (int64) vectorValue[i];
+	}
+	else
+	{
+		for (i = 0; i < arg1->dimension; i++)
+		{
+			if (!arg1->isnull[i])
+			{
+				transdata->N++;
+				transdata->sumX += (int64) vectorValue[i];
+			}
 		}
 	}
 
@@ -311,12 +348,21 @@ vint8acc(PG_FUNCTION_ARGS)
 
 	int64 *vectorValue = (int64*) arg1->value;
 
-	for (i = 0; i < arg1->dimension; i++)
+	if (!arg1->hasNulls)
 	{
-		if (!arg1->isnull[i])
-		{
-			state->N++;
+		state->N += arg1->dimension;
+		for (i = 0; i < arg1->dimension; i++)
 			state->sumX += (int128) vectorValue[i];
+	}
+	else
+	{
+		for (i = 0; i < arg1->dimension; i++)
+		{
+			if (!arg1->isnull[i])
+			{
+				state->N++;
+				state->sumX += (int128) vectorValue[i];
+			}
 		}
 	}
 

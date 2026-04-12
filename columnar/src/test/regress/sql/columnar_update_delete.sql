@@ -103,3 +103,29 @@ SELECT COUNT(*) from columnar_transaction_update;
 SELECT COUNT(*) from columnar_transaction_update WHERE j = -1;
 
 DROP TABLE columnar_transaction_update;
+
+-- VACUUM must preserve row-masked tuples after DELETE.
+
+CREATE TABLE columnar_vacuum_delete(i INT, j INT) using columnar;
+
+INSERT INTO columnar_vacuum_delete SELECT g, g * 10 FROM generate_series(1, 1000) g;
+
+DELETE FROM columnar_vacuum_delete WHERE i % 2 = 0;
+
+VACUUM columnar_vacuum_delete;
+
+SELECT COUNT(*) AS live_rows,
+       MIN(i) AS min_i,
+       MAX(i) AS max_i,
+       SUM((i % 2 = 0)::int) AS even_rows
+FROM columnar_vacuum_delete;
+
+SELECT reltuples FROM pg_class WHERE oid = 'columnar_vacuum_delete'::regclass;
+
+DELETE FROM columnar_vacuum_delete WHERE i % 3 = 0;
+
+SELECT COUNT(*) AS live_rows,
+       SUM((i % 3 = 0)::int) AS multiple_of_three_rows
+FROM columnar_vacuum_delete;
+
+DROP TABLE columnar_vacuum_delete;

@@ -82,6 +82,27 @@ fork makes `UPDATE`/`DELETE` substantially more usable:
    count is tiny for compressed columnar tables, so the callback ensures a
    minimum of 1000 virtual blocks to collect a representative sample.
 
+7. **Cached row-version reads for UPDATE** — The old-row-fetch path now
+   reuses a transaction-scoped random-access read state when the target row
+   is already in a flushed stripe. It also avoids flushing pending
+   appended rows unless the requested row could be in an in-progress stripe.
+   This removes the one-stripe-per-row UPDATE pathology and cuts the PG18
+   smoke benchmark's columnar UPDATE from roughly **25-27s** to **0.099s**
+   on the local x86_64 Docker test image.
+
+8. **Conservative VACUUM safety for row-masked stripes** — Plain `VACUUM`
+   no longer rewrites candidate stripes that contain row-mask deletions
+   through the old compaction path. That path could drop live rows after a
+   `DELETE` + `VACUUM`; now `VACUUM` preserves rows and still updates
+   `pg_class.reltuples` correctly. Row-mask-aware physical compaction is
+   left as future work rather than risking data loss.
+
+9. **Vector aggregate null fast path** — Vector columns now track whether a
+   batch contains any NULLs. Common aggregate kernels like `count(*)` and
+   integer `sum` skip per-row null checks for NOT NULL batches. A focused
+   1M-row NOT NULL aggregate test improved from **35.690ms** to
+   **33.519ms** median, about **6.1% faster**.
+
 ### Build & Run — PG18 Docker Image
 
 New self-contained build pipeline for PG18:
@@ -132,6 +153,11 @@ Added `columnar_dml_improvements.sql` covering the DML fixes:
 - Chunk group skip for fully-deleted groups
 - Multi-stripe UPDATE/DELETE within a single transaction
 - Bulk DML (10K+ rows), rollback correctness, interleaved DML+SELECT
+
+`columnar_update_delete.sql` also includes a focused regression for
+`DELETE` followed by plain `VACUUM`, which used to be able to hide every
+live row in a row-masked stripe. `columnar_vectorization.sql` covers the
+new vector aggregate NULL and NOT NULL fast paths.
 
 ## 🚀 Run Locally
 
@@ -245,22 +271,30 @@ looks impressive but is misleading. The old implementation:
 - Produced incorrect `reltuples` because deleted rows weren't
   subtracted, distorting planner estimates.
 
-Our 9.5s update is slower per-row but is actually **correct and
-concurrency-safe on PG18**:
+The 9.5s update number above is from the first correct PG18 DML
+implementation before row-version read-state caching. That version was
+safe, but it rebuilt a random-access columnar reader for every updated
+row and forced pending writes into many tiny stripes. The current
+implementation remains **correct and concurrency-safe on PG18** while
+removing that avoidable cost:
 
 - Stripe-level advisory locking — concurrent UPDATEs to different
   stripes no longer block each other.
 - `columnar_fetch_row_version` fetches a consistent full old tuple via
   `heap_form_tuple` + `ExecForceStoreHeapTuple` — no more use-after-free
   on varlena data.
+- Cached row-version read states avoid per-row reader setup when old
+  rows live in flushed stripes.
+- Pending appended rows are flushed only when needed, so an UPDATE of
+  100 existing rows leaves 2 stripes instead of 101.
 - Correct `ColumnarTableTupleCount` so `VACUUM` writes accurate
   `pg_class.reltuples`.
 
-So: upstream was faster because it was cutting corners that only held
-together on older PostgreSQL versions. On PG18 it crashes outright.
-There's still headroom on the per-row cost (the `HeapTuple` roundtrip
-per fetched row is expensive), but "fast but broken" wasn't a viable
-baseline to preserve.
+On the local PG18 smoke benchmark (`50k` rows, `--cleanup`), the
+columnar UPDATE path now runs in **0.099s**, versus roughly **25-27s**
+before the cache. A full 25M-row benchmark should be rerun before
+replacing the table above, but the targeted experiment removes the
+dominant DML overhead without weakening correctness.
 
 ### Analytic Query Performance (medians, ms)
 
@@ -292,12 +326,13 @@ work correctly on PG18.
   delete+insert semantics mean single-row UPDATEs will always be
   slower than heap's in-place updates.
 - **Correctness vs. shortcuts**: upstream's fast updates only worked
-  because they skipped work that PG17+ requires. Our port trades some
-  per-row UPDATE speed for actually-correct, crash-free, concurrently-
-  safe DML on modern PostgreSQL. Reads are within a few percent of
-  upstream, so if you're on PG14 today the reasons to move are
-  PG18 support, safe concurrent writes, correct planner stats, and
-  no table-level advisory lock on DML.
+  because they skipped work that PG17+ requires. This fork keeps the
+  correct old-row materialization path, but now caches the expensive
+  reader state and avoids unnecessary write flushing. Reads are within a
+  few percent of upstream, so if you're on PG14 today the reasons to
+  move are PG18 support, safe concurrent writes, correct planner stats,
+  no table-level advisory lock on DML, and much better UPDATE behavior
+  than the first PG18-safe implementation.
 
 For the upstream ClickBench results, see
 [BENCHMARKS](https://github.com/hydradatabase/hydra/blob/main/BENCHMARKS.md).
@@ -338,9 +373,14 @@ for OLTP tables.
   `ALTER TABLE ... ALTER COLUMN ... SET (n_distinct = N)` for columns
   with known cardinalities, or the planner picks bad GROUP BY
   strategies. The benchmark harness does this automatically.
-- `UPDATE` on columnar tables is still much slower than heap
-  (delete+insert semantics). Stripe-level locking helps concurrency,
-  but update throughput won't match heap.
+- `UPDATE` on columnar tables still uses delete+insert semantics, so
+  heap remains the right choice for OLTP-heavy point-update workloads.
+  The row-version read-state cache removes the worst per-row overhead
+  for bulk updates, but columnar updates still create new columnar rows.
+- Plain `VACUUM` is intentionally conservative for row-masked stripes.
+  It preserves live rows and updates `reltuples`, but physical
+  row-mask-aware stripe compaction still needs a dedicated safe rewrite
+  path.
 - `vacuum_columnar_table()` UDF is intentionally conservative — it
   relocates one stripe per call. Run in a loop for full compaction.
 

@@ -2448,6 +2448,7 @@ ColumnarScanNext(ColumnarScanState *columnarScanState)
 		{
 			VectorColumn *column = (VectorColumn *) vectorSlot->tts.tts_values[attrIndex];
 			memset(column->isnull, true, COLUMNAR_VECTOR_COLUMN_SIZE);
+			column->hasNulls = false;
 			column->dimension = 0;
 		}
 		vectorSlot->dimension = 0;

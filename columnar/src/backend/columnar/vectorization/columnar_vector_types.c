@@ -31,6 +31,7 @@ BuildVectorColumn(int16 columnDimension, int16 columnTypeLen,
 	vectorColumn->value = palloc0(columnTypeLen * COLUMNAR_VECTOR_COLUMN_SIZE);
 	vectorColumn->columnTypeLen = columnTypeLen;
 	vectorColumn->columnIsVal = columnIsVal;
+	vectorColumn->hasNulls = false;
 	vectorColumn->rowNumber = rowNumber;
 
 	return vectorColumn;
@@ -147,6 +148,10 @@ WriteTupleToVectorSlot(TupleTableSlot *in, VectorTupleTableSlot *vectorSlot,
 					PointerGetDatum(varLenTypeContainer);
 			}
 		}
+		else
+		{
+			column->hasNulls = true;
+		}
 
 		column->dimension++;
 	}
@@ -163,6 +168,7 @@ CleanupVectorSlot(VectorTupleTableSlot *vectorSlot)
 	{
 		VectorColumn *column = (VectorColumn *) vectorSlot->tts.tts_values[i];
 		memset(column->isnull, true, COLUMNAR_VECTOR_COLUMN_SIZE);
+		column->hasNulls = false;
 		column->dimension = 0;
 	}
 	

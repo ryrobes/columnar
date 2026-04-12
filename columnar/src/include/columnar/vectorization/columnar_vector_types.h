@@ -41,6 +41,7 @@ typedef struct VectorColumn
 	uint32	dimension;
 	uint16	columnTypeLen;
 	bool 	columnIsVal;
+	bool	hasNulls;
 	Datum	*value;
 	bool	isnull[COLUMNAR_VECTOR_COLUMN_SIZE];
 	uint64	*rowNumber;
