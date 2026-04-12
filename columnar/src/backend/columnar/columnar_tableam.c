@@ -16,10 +16,9 @@
 #include "storage/lockdefs.h"
 #include "utils/palloc.h"
 #include "utils/snapmgr.h"
-#if PG_VERSION_NUM >= 130000
 #include "access/detoast.h"
-#else
-#include "access/tuptoaster.h"
+#if PG_VERSION_NUM >= PG_VERSION_17
+#include "storage/read_stream.h"
 #endif
 #include "access/xact.h"
 #include "catalog/catalog.h"
@@ -790,6 +789,16 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *sscan,
 	slot->tts_tid = *tid;
 	ExecStoreVirtualTuple(slot);
 
+	/*
+	 * Materialize the slot so varlena values are copied into stable memory.
+	 * The columnar reader stores pass-by-ref datums as pointers into chunk
+	 * data buffers that may be freed on the next read.
+	 */
+	elog(NOTICE, "columnar_fetch_row_version: before materialize, isnull[0]=%d isnull[1]=%d isnull[2]=%d",
+		 slot->tts_isnull[0], slot->tts_isnull[1], slot->tts_isnull[2]);
+	ExecMaterializeSlot(slot);
+	elog(NOTICE, "columnar_fetch_row_version: after materialize OK");
+
 	return true;
 }
 
@@ -813,7 +822,7 @@ columnar_fetch_row_version(Relation relation,
 
 		List *scanQual = NIL;
 
-		bool randomAccess = false;
+		bool randomAccess = true;
 
 		*readState = init_columnar_read_state(relation,
 											  slot->tts_tupleDescriptor,
@@ -823,16 +832,32 @@ columnar_fetch_row_version(Relation relation,
 											  NULL);
 	}
 
+	/*
+	 * Flush pending writes so in-memory data is readable from storage.
+	 * Without this, reads return zero values for unflushed stripes.
+	 */
+	ColumnarReadFlushPendingWrites(*readState);
 	MemoryContext oldContext = MemoryContextSwitchTo(GetColumnarReadStateCache());
 	ColumnarReadRowByRowNumber(*readState, rowNumber,
 							   slot->tts_values, slot->tts_isnull);
 	MemoryContextSwitchTo(oldContext);
+	elog(NOTICE, "columnar_fetch_row_version: read complete, isnull[0]=%d isnull[1]=%d isnull[2]=%d",
+		 slot->tts_isnull[0], slot->tts_isnull[1], slot->tts_isnull[2]);
 
 	slot->tts_tableOid = RelationGetRelid(relation);
 	slot->tts_tid = *tid;
 
 	if (TTS_EMPTY(slot))
 		ExecStoreVirtualTuple(slot);
+
+	/*
+	 * Materialize the slot to copy pass-by-reference values into stable
+	 * memory.  The columnar reader stores varlena datums as pointers into
+	 * chunk data buffers that may be freed on the next read operation.
+	 * The executor (particularly PG18's ExecUpdatePrologue) may
+	 * materialize the slot later — by then the pointers could be stale.
+	 */
+	ExecMaterializeSlot(slot);
 
 	return true;
 }
@@ -1118,7 +1143,7 @@ columnar_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			ExecConstraints(resultRelInfo, tupleSlot, estate);
 		}
 
-		MemoryContextResetAndDeleteChildren(ColumnarWritePerTupleContext(writeState));
+		MemoryContextDeleteChildren(ColumnarWritePerTupleContext(writeState));
 	}
 
 	if (estate != NULL)
@@ -1142,6 +1167,20 @@ columnar_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 }
 
 
+/*
+ * columnar_stripe_lock_key computes an advisory lock key that is unique
+ * per (table, stripe) pair.  This allows concurrent modifications to
+ * different stripes of the same table.
+ *
+ * Uses a multiplicative hash to mix both full 64-bit values, since
+ * storageId can exceed 32 bits (sequence starts at 10,000,000,000).
+ */
+static int64
+columnar_stripe_lock_key(uint64 storageId, uint64 stripeId)
+{
+	return (int64)(storageId * UINT64CONST(6364136223846793005) + stripeId);
+}
+
 static TM_Result
 columnar_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 					  Snapshot snapshot, Snapshot crosscheck, bool wait,
@@ -1149,14 +1188,26 @@ columnar_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
 {
 	uint64 rowNumber = tid_to_row_number(*tid);
 	uint64 storageId = LookupStorageIdByRelation(relation);
-	/* Set lock for relation until transaction ends */
+
+	/*
+	 * Find the stripe containing this row for stripe-level locking.
+	 * Use GetTransactionSnapshot() rather than the caller's snapshot,
+	 * which may be NULL in some PG versions.
+	 */
+	StripeMetadata *stripeMetadata = FindStripeByRowNumber(relation, rowNumber,
+														   GetTransactionSnapshot());
+	if (!stripeMetadata)
+		return TM_Deleted;
+
+	/* Lock only the affected stripe until transaction ends */
 	DirectFunctionCall1(pg_advisory_xact_lock_int8,
-						Int64GetDatum((int64) storageId));
+						Int64GetDatum(columnar_stripe_lock_key(storageId,
+															   stripeMetadata->id)));
 
 #if PG_VERSION_NUM >= PG_VERSION_16
-	if (!UpdateRowMask(relation->rd_locator, storageId,  snapshot, rowNumber))
+	if (!UpdateRowMask(relation->rd_locator, storageId, GetTransactionSnapshot(), rowNumber))
 #else
-	if (!UpdateRowMask(relation->rd_node, storageId,  snapshot, rowNumber))
+	if (!UpdateRowMask(relation->rd_node, storageId, GetTransactionSnapshot(), rowNumber))
 #endif
 		return TM_Deleted;
 
@@ -1180,19 +1231,28 @@ columnar_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 					  LockTupleMode *lockmode, bool *update_indexes)
 #endif
 {
-
-	
 	uint64 rowNumber = tid_to_row_number(*otid);
 	uint64 storageId = LookupStorageIdByRelation(relation);
 
-	/* Set lock for relation until transaction ends */
+	/*
+	 * Find the stripe containing this row for stripe-level locking.
+	 * Use GetTransactionSnapshot() rather than the caller's snapshot,
+	 * which may be NULL in some PG versions.
+	 */
+	StripeMetadata *stripeMetadata = FindStripeByRowNumber(relation, rowNumber,
+														   GetTransactionSnapshot());
+	if (!stripeMetadata)
+		return TM_Deleted;
+
+	/* Lock only the affected stripe until transaction ends */
 	DirectFunctionCall1(pg_advisory_xact_lock_int8,
-						Int64GetDatum((int64) storageId));
+						Int64GetDatum(columnar_stripe_lock_key(storageId,
+															   stripeMetadata->id)));
 
 #if PG_VERSION_NUM >= PG_VERSION_16
-	if (!UpdateRowMask(relation->rd_locator, storageId, snapshot, rowNumber))
+	if (!UpdateRowMask(relation->rd_locator, storageId, GetTransactionSnapshot(), rowNumber))
 #else
-	if (!UpdateRowMask(relation->rd_node, storageId, snapshot, rowNumber))
+	if (!UpdateRowMask(relation->rd_node, storageId, GetTransactionSnapshot(), rowNumber))
 #endif
 		return TM_Deleted;
 
@@ -1242,6 +1302,16 @@ columnar_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 	{
 		ExecStoreVirtualTuple(slot);
 	}
+
+	/*
+	 * Materialize the slot so varlena pointers are copied into stable
+	 * memory.  The readState is allocated in CurrentMemoryContext which
+	 * may be short-lived, and PG18's executor materializes slots from
+	 * tuple_lock results in ExecUpdatePrologue.
+	 */
+	ExecMaterializeSlot(slot);
+
+	ColumnarEndRead(readState);
 
 	return TM_Ok;
 }
@@ -1333,16 +1403,9 @@ columnar_relation_nontransactional_truncate(Relation rel)
 
 	uint64 storageId = ColumnarMetadataNewStorageId();
 
-	if (unlikely(rel->rd_smgr == NULL))
-	{
-#if PG_VERSION_NUM >= PG_VERSION_16
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-#else
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-#endif
-	}
+	(void) RelationGetSmgr(rel);
 
-	ColumnarStorageInit(rel->rd_smgr, storageId);
+	ColumnarStorageInit(RelationGetSmgr(rel), storageId);
 }
 
 
@@ -1481,7 +1544,7 @@ NeededColumnsList(TupleDesc tupdesc, Bitmapset *attr_needed)
 
 	for (int i = 0; i < tupdesc->natts; i++)
 	{
-		if (tupdesc->attrs[i].attisdropped)
+		if (TupleDescAttr(tupdesc, i)->attisdropped)
 		{
 			continue;
 		}
@@ -1700,8 +1763,9 @@ TruncateAndCombineColumnarStripes(Relation rel, int elevel)
 }
 
 /*
- * ColumnarTableTupleCount returns the number of tuples that columnar
- * table with relationId has by using stripe metadata.
+ * ColumnarTableTupleCount returns the number of live tuples that columnar
+ * table with relationId has by using stripe metadata, subtracting any
+ * rows that have been marked as deleted in the row mask.
  */
 static uint64
 ColumnarTableTupleCount(Relation relation)
@@ -1717,7 +1781,11 @@ ColumnarTableTupleCount(Relation relation)
 	foreach(lc, stripeList)
 	{
 		StripeMetadata *stripe = lfirst(lc);
-		tupleCount += stripe->rowCount;
+		uint32 deletedRows = DeletedRowsForStripeByRelation(relation,
+															stripe->chunkCount,
+															stripe->id);
+		if (deletedRows < stripe->rowCount)
+			tupleCount += stripe->rowCount - deletedRows;
 	}
 
 	return tupleCount;
@@ -1791,10 +1859,17 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 	bool frozenxid_updated;
 	bool minmulti_updated;
 
+#if PG_VERSION_NUM >= PG_VERSION_18
+	vac_update_relstats(rel, new_rel_pages, new_live_tuples,
+						new_rel_allvisible, 0, nindexes > 0,
+						newRelFrozenXid, newRelminMxid,
+						&frozenxid_updated, &minmulti_updated, false);
+#else
 	vac_update_relstats(rel, new_rel_pages, new_live_tuples,
 						new_rel_allvisible, nindexes > 0,
 						newRelFrozenXid, newRelminMxid,
 						&frozenxid_updated, &minmulti_updated, false);
+#endif
 
 #else
 	TransactionId oldestXmin;
@@ -1858,10 +1933,17 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 #endif
 #endif
 
+#if PG_VERSION_NUM >= PG_VERSION_18
+	pgstat_report_vacuum(RelationGetRelid(rel),
+							rel->rd_rel->relisshared,
+							Max(new_live_tuples, 0),
+							0, 0);
+#else
 	pgstat_report_vacuum(RelationGetRelid(rel),
 							rel->rd_rel->relisshared,
 							Max(new_live_tuples, 0),
 							0);
+#endif
 	pgstat_progress_end_command();
 
 	/* Reenable the cache state. */
@@ -1904,7 +1986,7 @@ LogRelationStats(Relation rel, int elevel)
 													  GetTransactionSnapshot());
 		for (uint32 column = 0; column < skiplist->columnCount; column++)
 		{
-			bool attrDropped = tupdesc->attrs[column].attisdropped;
+			bool attrDropped = TupleDescAttr(tupdesc, column)->attisdropped;
 			for (uint32 chunk = 0; chunk < skiplist->chunkCount; chunk++)
 			{
 				ColumnChunkSkipNode *skipnode =
@@ -1939,16 +2021,9 @@ LogRelationStats(Relation rel, int elevel)
 
 	MemoryContextSwitchTo(oldcontext);
 
-	if (unlikely(rel->rd_smgr == NULL))
-	{
-#if PG_VERSION_NUM >= PG_VERSION_16
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-#else
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-#endif
-	}
+	(void) RelationGetSmgr(rel);
 
-	uint64 relPages = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+	uint64 relPages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 	RelationCloseSmgr(rel);
 
 	Datum storageId = DirectFunctionCall1(columnar_relation_storageid,
@@ -2064,16 +2139,9 @@ TruncateColumnar(Relation rel, int elevel)
 		uint64 newDataReservation = Max(GetHighestUsedAddress(rel->rd_node) + 1,
 										ColumnarFirstLogicalOffset);
 #endif
-		if (unlikely(rel->rd_smgr == NULL))
-		{
-#if PG_VERSION_NUM >= PG_VERSION_16
-			smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-#else
-			smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-#endif
-		}
+		(void) RelationGetSmgr(rel);
 
-		BlockNumber old_rel_pages = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+		BlockNumber old_rel_pages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 
 		if (!ColumnarStorageTruncate(rel, newDataReservation))
 		{
@@ -2081,7 +2149,7 @@ TruncateColumnar(Relation rel, int elevel)
 			return;
 		}
 
-		BlockNumber new_rel_pages = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+		BlockNumber new_rel_pages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 
 		ereport(elevel,
 		(errmsg("\"%s\": truncated %u to %u pages",
@@ -2137,9 +2205,14 @@ ConditionalLockRelationWithTimeout(Relation rel, LOCKMODE lockMode, int timeout,
 }
 
 
+#if PG_VERSION_NUM >= PG_VERSION_17
+static bool
+columnar_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
+#else
 static bool
 columnar_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
 								 BufferAccessStrategy bstrategy)
+#endif
 {
 	/*
 	 * Our access method is not pages based, i.e. tuples are not confined
@@ -2628,26 +2701,19 @@ columnar_relation_size(Relation rel, ForkNumber forkNumber)
 {
 	uint64 nblocks = 0;
 
-	if (unlikely(rel->rd_smgr == NULL))
-	{
-#if PG_VERSION_NUM >= PG_VERSION_16
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-#else
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-#endif
-	}
+	(void) RelationGetSmgr(rel);
 
 	/* InvalidForkNumber indicates returning the size for all forks */
 	if (forkNumber == InvalidForkNumber)
 	{
 		for (int i = 0; i < MAX_FORKNUM; i++)
 		{
-			nblocks += smgrnblocks(rel->rd_smgr, i);
+			nblocks += smgrnblocks(RelationGetSmgr(rel), i);
 		}
 	}
 	else
 	{
-		nblocks = smgrnblocks(rel->rd_smgr, forkNumber);
+		nblocks = smgrnblocks(RelationGetSmgr(rel), forkNumber);
 	}
 
 	return nblocks * BLCKSZ;
@@ -2666,16 +2732,9 @@ columnar_estimate_rel_size(Relation rel, int32 *attr_widths,
 						   BlockNumber *pages, double *tuples,
 						   double *allvisfrac)
 {
-	if (unlikely(rel->rd_smgr == NULL))
-	{
-#if PG_VERSION_NUM >= PG_VERSION_16
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-#else
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-#endif
-	}
+	(void) RelationGetSmgr(rel);
 
-	*pages = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+	*pages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 	*tuples = ColumnarTableRowCount(rel);
 
 	/*
@@ -3090,8 +3149,10 @@ static const TableAmRoutine columnar_am_methods = {
 
 	.relation_estimate_size = columnar_estimate_rel_size,
 
+#if PG_VERSION_NUM < PG_VERSION_18
 	.scan_bitmap_next_block = NULL,
 	.scan_bitmap_next_tuple = NULL,
+#endif
 	.scan_sample_next_block = columnar_scan_sample_next_block,
 	.scan_sample_next_tuple = columnar_scan_sample_next_tuple
 };
@@ -3127,22 +3188,28 @@ detoast_values(TupleDesc tupleDesc, Datum *orig_values, bool *isnull)
 	/* copy on write to optimize for case where nothing is toasted */
 	Datum *values = orig_values;
 
-	for (int i = 0; i < tupleDesc->natts; i++)
+	for (int i = 0; i < natts; i++)
 	{
-		if (!isnull[i] && tupleDesc->attrs[i].attlen == -1 &&
-			VARATT_IS_EXTENDED(values[i]))
+		if (!isnull[i] && TupleDescAttr(tupleDesc, i)->attlen == -1)
 		{
-			/* make a copy */
-			if (values == orig_values)
-			{
-				values = palloc(sizeof(Datum) * natts);
-				memcpy(values, orig_values, sizeof(Datum) * natts);
-			}
+			Datum d = values[i];
+			struct varlena *val = (struct varlena *) DatumGetPointer(d);
 
-			/* will be freed when per-tuple context is reset */
-			struct varlena *new_value = (struct varlena *) DatumGetPointer(values[i]);
-			new_value = detoast_attr(new_value);
-			values[i] = PointerGetDatum(new_value);
+			if (val == NULL)
+				continue;
+
+			if (VARATT_IS_EXTENDED(val))
+			{
+				/* make a copy */
+				if (values == orig_values)
+				{
+					values = palloc(sizeof(Datum) * natts);
+					memcpy(values, orig_values, sizeof(Datum) * natts);
+				}
+
+				/* will be freed when per-tuple context is reset */
+				values[i] = PointerGetDatum(detoast_attr(val));
+			}
 		}
 	}
 

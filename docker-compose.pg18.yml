@@ -1,0 +1,17 @@
+services:
+  columnar-pg18:
+    build:
+      context: .
+      dockerfile: Dockerfile.pg18
+    container_name: columnar_pg18
+    ports:
+      - "5418:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+    volumes:
+      - columnar_pg18_data:/var/lib/postgresql
+
+volumes:
+  columnar_pg18_data:

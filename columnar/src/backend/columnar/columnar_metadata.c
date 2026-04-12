@@ -511,10 +511,10 @@ SaveStripeSkipList(uint64 storageId, uint64 stripe, StripeSkipList *chunkList,
 			{
 				values[Anum_columnar_chunk_minimum_value - 1] =
 					PointerGetDatum(DatumToBytea(chunk->minimumValue,
-												 &tupleDescriptor->attrs[columnIndex]));
+												 TupleDescAttr(tupleDescriptor, columnIndex)));
 				values[Anum_columnar_chunk_maximum_value - 1] =
 					PointerGetDatum(DatumToBytea(chunk->maximumValue,
-												 &tupleDescriptor->attrs[columnIndex]));
+												 TupleDescAttr(tupleDescriptor, columnIndex)));
 			}
 			else
 			{
@@ -767,9 +767,9 @@ ReadStripeSkipListStorageId(uint64 storageId, uint64 stripe, TupleDesc tupleDesc
 				datumArray[Anum_columnar_chunk_maximum_value - 1]);
 
 			chunk->minimumValue =
-				ByteaToDatum(minValue, &tupleDescriptor->attrs[columnIndex]);
+				ByteaToDatum(minValue, TupleDescAttr(tupleDescriptor, columnIndex));
 			chunk->maximumValue =
-				ByteaToDatum(maxValue, &tupleDescriptor->attrs[columnIndex]);
+				ByteaToDatum(maxValue, TupleDescAttr(tupleDescriptor, columnIndex));
 
 			chunk->hasMinMax = true;
 		}
@@ -1021,7 +1021,16 @@ UpdateRowMask(RelFileLocator relfilelocator, uint64 storageId,
 
 	rowMaskEntry->deletedRows++;
 
-	CommandCounterIncrement();
+	/*
+	 * Note: we intentionally do NOT call CommandCounterIncrement() here.
+	 * The row mask modification is purely in-memory (write state cache).
+	 * Subsequent deletes in the same command find the cached entry via
+	 * RowMaskFindWriteState() and see the updated bitmap directly.
+	 * The CCI in FlushRowMaskCache() handles catalog visibility when
+	 * the write state is flushed to the columnar.row_mask heap table.
+	 * Removing the per-row CCI avoids significant overhead during bulk
+	 * DELETE/UPDATE operations.
+	 */
 
 	return true;
 }
@@ -1812,21 +1821,25 @@ UpdateStripeMetadataRow(uint64 storageId, uint64 stripeId, bool *update,
 	}
 
 	/*
-	 * heap_inplace_update already doesn't allow changing size of the original
-	 * tuple, so we don't allow setting any Datum's to NULL values.
+	 * heap_inplace_update was removed in PG18.  Use simple_heap_update
+	 * which performs a regular tuple update without catalog overhead.
 	 */
 	bool newNulls[Natts_columnar_stripe] = { false };
 	TupleDesc tupleDescriptor = RelationGetDescr(columnarStripes);
 	HeapTuple modifiedTuple = heap_modify_tuple(oldTuple, tupleDescriptor,
 												newValues, newNulls, update);
 
-	heap_inplace_update(columnarStripes, modifiedTuple);
+#if PG_VERSION_NUM >= PG_VERSION_18
+	{
+		TU_UpdateIndexes update_indexes = TU_None;
+		simple_heap_update(columnarStripes, &oldTuple->t_self, modifiedTuple,
+						   &update_indexes);
+	}
+#else
+	simple_heap_update(columnarStripes, &oldTuple->t_self, modifiedTuple);
+#endif
 
-	/*
-	 * Existing tuple now contains modifications, because we used
-	 * heap_inplace_update().
-	 */
-	HeapTuple newTuple = oldTuple;
+	HeapTuple newTuple = modifiedTuple;
 
 	/*
 	 * Must not pass modifiedTuple, because BuildStripeMetadata expects a real
@@ -2257,7 +2270,11 @@ create_estate_for_relation(Relation rel)
 	rte->relid = RelationGetRelid(rel);
 	rte->relkind = rel->rd_rel->relkind;
 	rte->rellockmode = AccessShareLock;
-#if PG_VERSION_NUM >= PG_VERSION_16
+#if PG_VERSION_NUM >= PG_VERSION_18
+	List *perminfos = NIL;
+	addRTEPermissionInfo(&perminfos, rte);
+	ExecInitRangeTable(estate, list_make1(rte), perminfos, NULL);
+#elif PG_VERSION_NUM >= PG_VERSION_16
 	List *perminfos = NIL;
 	addRTEPermissionInfo(&perminfos, rte);
 	ExecInitRangeTable(estate, list_make1(rte), perminfos);
@@ -2646,23 +2663,12 @@ ColumnarStorageUpdateIfNeeded(Relation rel, bool isUpgrade)
 		return;
 	}
 
-	/*
-	 * RelationGetSmgr was added in 15, but only backported to 13.10 and 14.07
-	 * leaving other versions requiring something like this.
-	 */
-	if (unlikely(rel->rd_smgr == NULL))
-	{
-	#if PG_VERSION_NUM >= PG_VERSION_16
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-	#else
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-	#endif
-	}
+	SMgrRelation smgr = RelationGetSmgr(rel);
 
-	BlockNumber nblocks = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+	BlockNumber nblocks = smgrnblocks(smgr, MAIN_FORKNUM);
 	if (nblocks < 2)
 	{
-		ColumnarStorageInit(rel->rd_smgr, ColumnarMetadataNewStorageId());
+		ColumnarStorageInit(smgr, ColumnarMetadataNewStorageId());
 		return;
 	}
 

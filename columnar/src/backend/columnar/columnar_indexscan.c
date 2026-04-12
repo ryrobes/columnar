@@ -1,3 +1,5 @@
+#include "citus_version.h"
+
 #include "postgres.h"
 
 #include "access/nbtree.h"
@@ -5,7 +7,12 @@
 #include "access/tableam.h"
 #include "catalog/pg_am.h"
 #include "catalog/index.h"
+#include "commands/explain.h"
+#if PG_VERSION_NUM >= PG_VERSION_18
+#include "commands/explain_format.h"
+#endif
 #include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeIndexscan.h"
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
@@ -605,6 +612,21 @@ ColumnarIndexScan_ExecIndexScanInitializeDSM(IndexScanState *node,
 	EState *estate = node->ss.ps.state;
 	ParallelIndexScanDesc piscan = (ParallelIndexScanDesc) coordinate;
 
+#if PG_VERSION_NUM >= PG_VERSION_18
+	index_parallelscan_initialize(node->ss.ss_currentRelation,
+								  node->iss_RelationDesc,
+								  estate->es_snapshot,
+								  false, false, 0, NULL,
+								  piscan);
+
+	node->iss_ScanDesc =
+		index_beginscan_parallel(node->ss.ss_currentRelation,
+								 node->iss_RelationDesc,
+								 NULL,
+								 node->iss_NumScanKeys,
+								 node->iss_NumOrderByKeys,
+								 piscan);
+#else
 	index_parallelscan_initialize(node->ss.ss_currentRelation,
 								  node->iss_RelationDesc,
 								  estate->es_snapshot,
@@ -616,6 +638,7 @@ ColumnarIndexScan_ExecIndexScanInitializeDSM(IndexScanState *node,
 								 node->iss_NumScanKeys,
 								 node->iss_NumOrderByKeys,
 								 piscan);
+#endif
 
 	/*
 	 * If no run-time keys to calculate or they are ready, go ahead and pass
@@ -640,12 +663,22 @@ ColumnarIndexScan_ExecIndexScanInitializeWorker(IndexScanState *node,
 {
 	ParallelIndexScanDesc piscan = (ParallelIndexScanDesc) coordinate;
 
+#if PG_VERSION_NUM >= PG_VERSION_18
+	node->iss_ScanDesc =
+		index_beginscan_parallel(node->ss.ss_currentRelation,
+								 node->iss_RelationDesc,
+								 NULL,
+								 node->iss_NumScanKeys,
+								 node->iss_NumOrderByKeys,
+								 piscan);
+#else
 	node->iss_ScanDesc =
 		index_beginscan_parallel(node->ss.ss_currentRelation,
 								 node->iss_RelationDesc,
 								 node->iss_NumScanKeys,
 								 node->iss_NumOrderByKeys,
 								 piscan);
+#endif
 
 	/*
 	 * If no run-time keys to calculate or they are ready, go ahead and pass
@@ -723,7 +756,12 @@ ColumnarIndexScan_BeginCustomScan(CustomScanState *css, EState *estate, int efla
 	IndexScan *isNode = (IndexScan *) linitial(cscan->custom_plans);
 	
 	/* Free the exprcontext */
+#if PG_VERSION_NUM >= PG_VERSION_18
+	if (css->ss.ps.ps_ExprContext)
+		FreeExprContext(css->ss.ps.ps_ExprContext, true);
+#else
 	ExecFreeExprContext(&css->ss.ps);
+#endif
 
 	/* Clean out the tuple table */
 	ExecClearTuple(css->ss.ps.ps_ResultTupleSlot);

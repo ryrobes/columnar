@@ -1,0 +1,27 @@
+FROM postgres:18-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc make libssl-dev autoconf pkg-config \
+    postgresql-server-dev-18 \
+    libcurl4-gnutls-dev liblz4-dev libzstd-dev gdb \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY columnar /columnar
+WORKDIR /columnar
+
+RUN ./configure CFLAGS="-g -O0" && make clean && make && make install
+
+# --- Runtime image ---
+FROM postgres:18-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends gdb && rm -rf /var/lib/apt/lists/*
+
+# Copy the built extension files (with debug symbols)
+COPY --from=builder /usr/share/postgresql/18/extension/columnar* /usr/share/postgresql/18/extension/
+COPY --from=builder /usr/lib/postgresql/18/lib/columnar.so /usr/lib/postgresql/18/lib/columnar.so
+COPY --from=builder /usr/lib/postgresql/18/lib/bitcode/columnar* /usr/lib/postgresql/18/lib/bitcode/
+# Copy debug symbols from builder
+COPY --from=builder /columnar/src/backend/columnar/columnar_tableam.o /tmp/debug/
+
+# Auto-create the extension on startup
+COPY files/postgres/docker-entrypoint-initdb.d /docker-entrypoint-initdb.d/

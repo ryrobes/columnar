@@ -13,6 +13,7 @@ test: columnar_permissions
 test: columnar_empty
 test: columnar_insert
 test: columnar_update_delete
+test: columnar_dml_improvements
 test: columnar_cursor
 test: columnar_copyto
 test: columnar_alter

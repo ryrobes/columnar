@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -20,6 +21,13 @@ from urllib.parse import quote
 
 BASE_EVENT_TIME = datetime(2026, 1, 1, tzinfo=timezone.utc)
 QUERY_FILE = Path(__file__).with_name("queries") / "clickbench_like.sql"
+SUPPORTED_HYDRA_LAYOUTS = {
+    "heap",
+    "columnar",
+    "hybrid_hot_cold",
+    "hybrid_partitioned",
+}
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 TABLE_COLUMNS = textwrap.dedent(
@@ -51,8 +59,16 @@ TABLE_COLUMNS = textwrap.dedent(
 
 
 @dataclass
+class BenchmarkTarget:
+    label: str
+    layout: str
+    dsn: str
+
+
+@dataclass
 class LayoutContext:
     name: str
+    layout: str
     schema: str
     logical_table: str
     write_table: str
@@ -72,6 +88,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dsn",
         help="PostgreSQL DSN. Defaults to DATABASE_URL or a DSN built from .env.",
+    )
+    parser.add_argument(
+        "--vanilla-dsn",
+        help=(
+            "Optional DSN for a secondary vanilla Postgres-compatible server. "
+            "Runs the normal table baseline there and reports it as vanilla_postgres."
+        ),
+    )
+    parser.add_argument(
+        "--vanilla-label",
+        default="vanilla_postgres",
+        help="Display/schema label for --vanilla-dsn. Default: %(default)s",
     )
     parser.add_argument(
         "--rows",
@@ -143,6 +171,20 @@ def parse_args() -> argparse.Namespace:
         parser.error("--append-batches must be non-negative")
     if args.append_rows <= 0:
         parser.error("--append-rows must be positive")
+
+    hydra_layouts = [item.strip() for item in args.layouts.split(",") if item.strip()]
+    unknown_layouts = sorted(set(hydra_layouts) - SUPPORTED_HYDRA_LAYOUTS)
+    if unknown_layouts:
+        parser.error(
+            "--layouts contains unsupported Hydra layouts: "
+            + ", ".join(unknown_layouts)
+        )
+    if not hydra_layouts:
+        parser.error("--layouts must contain at least one Hydra layout")
+    if not IDENTIFIER_RE.match(args.vanilla_label):
+        parser.error("--vanilla-label must be a simple SQL identifier")
+    if args.vanilla_label in hydra_layouts:
+        parser.error("--vanilla-label must not duplicate a Hydra layout label")
 
     return args
 
@@ -356,26 +398,49 @@ def build_partition_bounds(
 
 def create_layout_schema(
     dsn: str,
+    label: str,
     layout: str,
     rows: int,
     append_rows_total: int,
     hot_fraction: float,
     verbose: bool = False,
 ) -> LayoutContext:
-    schema = layout_schema(layout)
-    exec_sql(
-        dsn,
-        textwrap.dedent(
-            f"""
-            CREATE EXTENSION IF NOT EXISTS columnar;
-            DROP SCHEMA IF EXISTS {schema} CASCADE;
-            CREATE SCHEMA {schema};
-            """
-        ),
-        verbose=verbose,
+    schema = layout_schema(label)
+    setup_sql = textwrap.dedent(
+        f"""
+        DROP SCHEMA IF EXISTS {schema} CASCADE;
+        CREATE SCHEMA {schema};
+        """
     )
+    if layout == "vanilla_postgres":
+        setup_sql = "SET default_table_access_method = heap;\n" + setup_sql
+    else:
+        setup_sql = "CREATE EXTENSION IF NOT EXISTS columnar;\n" + setup_sql
+
+    exec_sql(dsn, setup_sql, verbose=verbose)
 
     columns = table_columns_clause()
+
+    if layout == "vanilla_postgres":
+        exec_sql(
+            dsn,
+            textwrap.dedent(
+                f"""
+                CREATE TABLE {schema}.events (
+                    {columns}
+                ) USING heap;
+                """
+            ),
+            verbose=verbose,
+        )
+        return LayoutContext(
+            name=label,
+            layout=layout,
+            schema=schema,
+            logical_table=f"{schema}.events",
+            write_table=f"{schema}.events",
+            size_tables=["events"],
+        )
 
     if layout == "heap":
         exec_sql(
@@ -390,7 +455,8 @@ def create_layout_schema(
             verbose=verbose,
         )
         return LayoutContext(
-            name=layout,
+            name=label,
+            layout=layout,
             schema=schema,
             logical_table=f"{schema}.events",
             write_table=f"{schema}.events",
@@ -410,7 +476,8 @@ def create_layout_schema(
             verbose=verbose,
         )
         return LayoutContext(
-            name=layout,
+            name=label,
+            layout=layout,
             schema=schema,
             logical_table=f"{schema}.events",
             write_table=f"{schema}.events",
@@ -439,7 +506,8 @@ def create_layout_schema(
             verbose=verbose,
         )
         return LayoutContext(
-            name=layout,
+            name=label,
+            layout=layout,
             schema=schema,
             logical_table=f"{schema}.events_read",
             write_table=f"{schema}.events_hot",
@@ -490,7 +558,8 @@ def create_layout_schema(
             )
 
         return LayoutContext(
-            name=layout,
+            name=label,
+            layout=layout,
             schema=schema,
             logical_table=f"{schema}.events",
             write_table=f"{schema}.events",
@@ -524,7 +593,7 @@ def load_rows(
 
 def analyze_layout(dsn: str, ctx: LayoutContext, verbose: bool = False) -> float:
     targets = [ctx.logical_table]
-    if ctx.name == "hybrid_hot_cold":
+    if ctx.layout == "hybrid_hot_cold":
         targets = [f"{ctx.schema}.events_hot", f"{ctx.schema}.events_cold"]
 
     start = time.perf_counter()
@@ -732,7 +801,7 @@ def update_hot_slice(
     work_rows: int,
     verbose: bool = False,
 ) -> dict[str, Any]:
-    if ctx.name == "hybrid_partitioned" and ctx.hot_start_time is not None:
+    if ctx.layout == "hybrid_partitioned" and ctx.hot_start_time is not None:
         predicate = f"event_time >= {sql_literal(ctx.hot_start_time.isoformat())}"
         sql = textwrap.dedent(
             f"""
@@ -788,11 +857,11 @@ def update_hot_slice(
     }
 
 
-def cleanup_layouts(dsn: str, layouts: list[str], verbose: bool = False) -> None:
-    for layout in layouts:
+def cleanup_targets(targets: list[BenchmarkTarget], verbose: bool = False) -> None:
+    for target in targets:
         exec_sql(
-            dsn,
-            f"DROP SCHEMA IF EXISTS {layout_schema(layout)} CASCADE;",
+            target.dsn,
+            f"DROP SCHEMA IF EXISTS {layout_schema(target.label)} CASCADE;",
             verbose=verbose,
         )
 
@@ -846,6 +915,29 @@ def print_summary(report: dict[str, Any]) -> None:
     if not layouts:
         return
 
+    print("\nLayout metrics")
+    print("=" * 14)
+    metric_rows = [
+        ("total_size_mb", lambda result: bytes_to_mb(sum(result["sizes"].values()))),
+        ("load_seconds", lambda result: result["load_seconds"]),
+        (
+            "transition_seconds",
+            lambda result: (result.get("transition") or {}).get("seconds", 0.0),
+        ),
+        (
+            "append_total_seconds",
+            lambda result: result["append"].get("total_seconds", 0.0),
+        ),
+        ("update_seconds", lambda result: result["update"]["seconds"]),
+    ]
+    render_matrix(
+        ["metric"] + layouts,
+        [
+            [metric_name] + [f"{metric_fn(report['layouts'][layout]):.3f}" for layout in layouts]
+            for metric_name, metric_fn in metric_rows
+        ],
+    )
+
     common_queries = sorted(
         set.intersection(
             *(
@@ -860,36 +952,65 @@ def print_summary(report: dict[str, Any]) -> None:
 
     print("\nPer-query medians (ms)")
     print("=" * 22)
-    header = ["query"] + layouts
+    render_matrix(
+        ["query"] + layouts,
+        [
+            [
+                query_name,
+                *[
+                    f"{report['layouts'][layout]['queries'][query_name]['median_ms']:.3f}"
+                    for layout in layouts
+                ],
+            ]
+            for query_name in common_queries
+        ],
+    )
+
+
+def bytes_to_mb(value: int) -> float:
+    return value / 1024 / 1024
+
+
+def render_matrix(header: list[str], rows: list[list[str]]) -> None:
     widths = [max(24, len(header[0]))]
-    widths.extend(max(18, len(name)) for name in layouts)
+    widths.extend(max(18, len(name)) for name in header[1:])
 
     def render_row(values: list[str]) -> str:
         return "  ".join(value.ljust(width) for value, width in zip(values, widths))
 
     print(render_row(header))
     print(render_row(["-" * len(item) for item in header]))
-
-    for query_name in common_queries:
-        row = [query_name]
-        for layout in layouts:
-            median = report["layouts"][layout]["queries"][query_name]["median_ms"]
-            row.append(f"{median:.3f}")
+    for row in rows:
         print(render_row(row))
 
 
 def main() -> int:
     args = parse_args()
     dsn = args.dsn or default_dsn()
-    layouts = [item.strip() for item in args.layouts.split(",") if item.strip()]
+    hydra_layouts = [item.strip() for item in args.layouts.split(",") if item.strip()]
+    targets = [
+        BenchmarkTarget(label=layout, layout=layout, dsn=dsn)
+        for layout in hydra_layouts
+    ]
+    if args.vanilla_dsn:
+        targets.append(
+            BenchmarkTarget(
+                label=args.vanilla_label,
+                layout="vanilla_postgres",
+                dsn=args.vanilla_dsn,
+            )
+        )
 
     report: dict[str, Any] = {
         "config": {
-            "dsn": "<redacted>",
+            "hydra_dsn": "<redacted>",
+            "vanilla_dsn": "<redacted>" if args.vanilla_dsn else None,
             "rows": args.rows,
             "work_rows": args.work_rows,
             "hot_fraction": args.hot_fraction,
-            "layouts": layouts,
+            "layouts": [target.label for target in targets],
+            "hydra_layouts": hydra_layouts,
+            "vanilla_label": args.vanilla_label if args.vanilla_dsn else None,
             "query_runs": args.query_runs,
             "append_batches": args.append_batches,
             "append_rows": args.append_rows,
@@ -900,10 +1021,11 @@ def main() -> int:
     }
 
     try:
-        for layout in layouts:
+        for target in targets:
             ctx = create_layout_schema(
-                dsn,
-                layout,
+                target.dsn,
+                label=target.label,
+                layout=target.layout,
                 rows=args.rows,
                 append_rows_total=(args.append_rows * args.append_batches),
                 hot_fraction=args.hot_fraction,
@@ -911,7 +1033,7 @@ def main() -> int:
             )
 
             load_seconds = load_rows(
-                dsn,
+                target.dsn,
                 ctx.write_table,
                 1,
                 args.rows,
@@ -920,33 +1042,33 @@ def main() -> int:
             )
 
             transition_info: dict[str, Any] | None = None
-            if layout == "hybrid_hot_cold":
+            if target.layout == "hybrid_hot_cold":
                 transition_info = archive_hybrid(
-                    dsn,
+                    target.dsn,
                     ctx,
                     args.rows,
                     args.work_rows,
                     args.hot_fraction,
                     verbose=args.verbose,
                 )
-            elif layout == "hybrid_partitioned":
+            elif target.layout == "hybrid_partitioned":
                 transition_info = convert_partitioned_cold_partitions(
-                    dsn,
+                    target.dsn,
                     ctx,
                     verbose=args.verbose,
                 )
 
-            analyze_seconds = analyze_layout(dsn, ctx, verbose=args.verbose)
-            sizes = relation_sizes(dsn, ctx)
+            analyze_seconds = analyze_layout(target.dsn, ctx, verbose=args.verbose)
+            sizes = relation_sizes(target.dsn, ctx)
             query_results = run_query_suite(
-                dsn,
+                target.dsn,
                 ctx,
                 args.rows,
                 args.work_rows,
                 args.query_runs,
             )
             append_result = append_batches(
-                dsn,
+                target.dsn,
                 ctx,
                 args.rows,
                 args.work_rows,
@@ -955,15 +1077,19 @@ def main() -> int:
                 verbose=args.verbose,
             )
             update_result = update_hot_slice(
-                dsn,
+                target.dsn,
                 ctx,
                 args.rows + (args.append_rows * args.append_batches),
                 args.work_rows,
                 verbose=args.verbose,
             )
-            logical_rows = query_scalar_int(dsn, f"SELECT COUNT(*) FROM {ctx.logical_table};")
+            logical_rows = query_scalar_int(
+                target.dsn,
+                f"SELECT COUNT(*) FROM {ctx.logical_table};",
+            )
 
-            report["layouts"][layout] = {
+            report["layouts"][target.label] = {
+                "layout": target.layout,
                 "schema": ctx.schema,
                 "logical_table": ctx.logical_table,
                 "write_table": ctx.write_table,
@@ -979,7 +1105,7 @@ def main() -> int:
 
     finally:
         if args.cleanup:
-            cleanup_layouts(dsn, layouts, verbose=args.verbose)
+            cleanup_targets(targets, verbose=args.verbose)
 
     print_summary(report)
 

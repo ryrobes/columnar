@@ -130,12 +130,13 @@ lint_fix_acceptance:
 		golangci-lint run --fix
 
 BENCH_DSN ?=
+BENCH_VANILLA_DSN ?=
 BENCH_ARGS ?=
 
 .PHONY: bench_storage
 bench_storage:
-	python3 bench/local_storage_benchmark.py $(if $(BENCH_DSN),--dsn "$(BENCH_DSN)",) $(BENCH_ARGS)
+	python3 bench/local_storage_benchmark.py $(if $(BENCH_DSN),--dsn "$(BENCH_DSN)",) $(if $(BENCH_VANILLA_DSN),--vanilla-dsn "$(BENCH_VANILLA_DSN)",) $(BENCH_ARGS)
 
 .PHONY: bench_storage_smoke
 bench_storage_smoke:
-	python3 bench/local_storage_benchmark.py $(if $(BENCH_DSN),--dsn "$(BENCH_DSN)",) --rows 50000 --query-runs 1 --append-batches 3 --append-rows 1000 $(BENCH_ARGS)
+	python3 bench/local_storage_benchmark.py $(if $(BENCH_DSN),--dsn "$(BENCH_DSN)",) $(if $(BENCH_VANILLA_DSN),--vanilla-dsn "$(BENCH_VANILLA_DSN)",) --rows 50000 --query-runs 1 --append-batches 3 --append-rows 1000 $(BENCH_ARGS)

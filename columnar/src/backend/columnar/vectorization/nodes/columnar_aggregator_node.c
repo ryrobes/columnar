@@ -1622,6 +1622,22 @@ build_hash_table(AggState *aggstate, int setno, long nbuckets)
 	 */
 	additionalsize = aggstate->numtrans * sizeof(AggStatePerGroupData);
 
+#if PG_VERSION_NUM >= PG_VERSION_18
+	perhash->hashtable = BuildTupleHashTable(&aggstate->ss.ps,
+												perhash->hashslot->tts_tupleDescriptor,
+												&TTSOpsMinimalTuple,
+												perhash->numCols,
+												perhash->hashGrpColIdxHash,
+												perhash->eqfuncoids,
+												perhash->hashfunctions,
+												perhash->aggnode->grpCollations,
+												nbuckets,
+												additionalsize,
+												metacxt,
+												hashcxt,
+												tmpcxt,
+												DO_AGGSPLIT_SKIPFINAL(aggstate->aggsplit));
+#else
 	perhash->hashtable = BuildTupleHashTableExt(&aggstate->ss.ps,
 												perhash->hashslot->tts_tupleDescriptor,
 												perhash->numCols,
@@ -1635,6 +1651,7 @@ build_hash_table(AggState *aggstate, int setno, long nbuckets)
 												hashcxt,
 												tmpcxt,
 												DO_AGGSPLIT_SKIPFINAL(aggstate->aggsplit));
+#endif
 }
 
 /*
@@ -2182,11 +2199,16 @@ initialize_hash_entry(AggState *aggstate, TupleHashTable hashtable,
 	if (aggstate->numtrans == 0)
 		return;
 
+#if PG_VERSION_NUM >= PG_VERSION_18
+	pergroup = (AggStatePerGroup)
+		TupleHashEntryGetAdditional(hashtable, entry);
+#else
 	pergroup = (AggStatePerGroup)
 		MemoryContextAlloc(hashtable->tablecxt,
 						   sizeof(AggStatePerGroupData) * aggstate->numtrans);
 
 	entry->additional = pergroup;
+#endif
 
 	/*
 	 * Initialize aggregates for new tuple group, lookup_hash_entries()
@@ -2250,7 +2272,11 @@ lookup_hash_entries(AggState *aggstate)
 		{
 			if (isnew)
 				initialize_hash_entry(aggstate, hashtable, entry);
+#if PG_VERSION_NUM >= PG_VERSION_18
+			pergroup[setno] = TupleHashEntryGetAdditional(hashtable, entry);
+#else
 			pergroup[setno] = entry->additional;
+#endif
 		}
 		else
 		{
@@ -2850,7 +2876,11 @@ agg_refill_hash_table(AggState *aggstate)
 		{
 			if (isnew)
 				initialize_hash_entry(aggstate, perhash->hashtable, entry);
+#if PG_VERSION_NUM >= PG_VERSION_18
+			aggstate->hash_pergroup[batch->setno] = TupleHashEntryGetAdditional(perhash->hashtable, entry);
+#else
 			aggstate->hash_pergroup[batch->setno] = entry->additional;
+#endif
 			advance_aggregates(aggstate);
 		}
 		else
@@ -3038,7 +3068,11 @@ agg_retrieve_hash_table_in_memory(AggState *aggstate)
 		}
 		ExecStoreVirtualTuple(firstSlot);
 
+#if PG_VERSION_NUM >= PG_VERSION_18
+		pergroup = (AggStatePerGroup) TupleHashEntryGetAdditional(perhash->hashtable, entry);
+#else
 		pergroup = (AggStatePerGroup) entry->additional;
+#endif
 
 		/*
 		 * Use the representative input tuple for any references to
@@ -4876,7 +4910,12 @@ ExecEndAgg(AggState *node)
 	 * ExecFreeExprContext), just unlinking the output one from the plan node
 	 * suffices.
 	 */
+#if PG_VERSION_NUM >= PG_VERSION_18
+	if (node->ss.ps.ps_ExprContext)
+		FreeExprContext(node->ss.ps.ps_ExprContext, true);
+#else
 	ExecFreeExprContext(&node->ss.ps);
+#endif
 
 	/* clean up tuple table */
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
@@ -5291,7 +5330,12 @@ BeginVectorAgg(CustomScanState *css, EState *estate, int eflags)
 	Agg	*aggNode = (Agg *)linitial(cscan->custom_plans);
 
 	/* Free the exprcontext */
+#if PG_VERSION_NUM >= PG_VERSION_18
+	if (css->ss.ps.ps_ExprContext)
+		FreeExprContext(css->ss.ps.ps_ExprContext, true);
+#else
 	ExecFreeExprContext(&css->ss.ps);
+#endif
 
 	/* Clean out the tuple table */
 	ExecClearTuple(css->ss.ps.ps_ResultTupleSlot);

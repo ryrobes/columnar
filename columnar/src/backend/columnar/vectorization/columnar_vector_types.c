@@ -96,7 +96,7 @@ ExtractTupleFromVectorSlot(TupleTableSlot *out, VectorTupleTableSlot *vectorSlot
 	int attno;
 	foreach_int(attno, attrNeededList)
 	{
-		if (!out->tts_tupleDescriptor->attrs[attno].attisdropped)
+		if (!TupleDescAttr(out->tts_tupleDescriptor, attno)->attisdropped)
 		{
 			VectorColumn *column = (VectorColumn *) vectorSlot->tts.tts_values[attno];
 			int8 *rawColumRawData = (int8*) column->value + column->columnTypeLen * index;

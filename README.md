@@ -36,7 +36,8 @@ For local layout comparisons against a running instance, use the
 synthetic harness in [bench/README.md](./bench/README.md). It compares
 `heap`, `columnar`, `hybrid_hot_cold`, and `hybrid_partitioned`
 layouts with a ClickBench-inspired query mix plus append and update
-timings.
+timings, and can optionally include a secondary `vanilla_postgres`
+baseline from another Postgres-compatible server.
 
 ## 🙋 FAQs
 

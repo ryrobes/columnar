@@ -16,12 +16,8 @@
 
 #include "postgres.h"
 
-#if PG_VERSION_NUM >= 130000
 #include "access/heaptoast.h"
 #include "common/hashfn.h"
-#else
-#include "access/tuptoaster.h"
-#endif
 #include "executor/executor.h"
 
 #include "columnar/columnar_tableam.h"

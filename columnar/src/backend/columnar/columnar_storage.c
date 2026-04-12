@@ -371,16 +371,9 @@ ColumnarStorageGetReservedOffset(Relation rel, bool force)
 bool
 ColumnarStorageIsCurrent(Relation rel)
 {
-	if (unlikely(rel->rd_smgr == NULL))
-	{
-#if PG_VERSION_NUM >= PG_VERSION_16
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-#else
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-#endif
-	}
+	(void) RelationGetSmgr(rel);
 
-	BlockNumber nblocks = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+	BlockNumber nblocks = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 
 	if (nblocks < 2)
 	{
@@ -464,16 +457,9 @@ ColumnarStorageReserveData(Relation rel, uint64 amount)
 	PhysicalAddr final = LogicalToPhysical(nextReservation - 1);
 
 	/* extend with new pages */
-	if (unlikely(rel->rd_smgr == NULL))
-	{
-#if PG_VERSION_NUM >= PG_VERSION_16
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-#else
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-#endif
-	}
+	(void) RelationGetSmgr(rel);
 
-	BlockNumber nblocks = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+	BlockNumber nblocks = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 
 	while (nblocks <= final.blockno)
 	{
@@ -580,16 +566,9 @@ ColumnarStorageTruncate(Relation rel, uint64 newDataReservation)
 			 rel->rd_id, newDataReservation);
 	}
 
-	if (unlikely(rel->rd_smgr == NULL))
-	{
-#if PG_VERSION_NUM >= PG_VERSION_16
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-#else
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-#endif
-	}
+	(void) RelationGetSmgr(rel);
 
-	BlockNumber old_rel_pages = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+	BlockNumber old_rel_pages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 	if (old_rel_pages == 0)
 	{
 		/* nothing to do */
@@ -668,16 +647,9 @@ ColumnarOverwriteMetapage(Relation relation, ColumnarMetapage columnarMetapage)
 static ColumnarMetapage
 ColumnarMetapageRead(Relation rel, bool force)
 {
-	if (unlikely(rel->rd_smgr == NULL))
-	{
-#if PG_VERSION_NUM >= PG_VERSION_16
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_locator, rel->rd_backend));
-#else
-		smgrsetowner(&(rel->rd_smgr), smgropen(rel->rd_node, rel->rd_backend));
-#endif
-	}
+	(void) RelationGetSmgr(rel);
 
-	BlockNumber nblocks = smgrnblocks(rel->rd_smgr, MAIN_FORKNUM);
+	BlockNumber nblocks = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
 	if (nblocks == 0)
 	{
 		/*

@@ -928,6 +928,30 @@ ReadStripeNextRow(StripeReadState *stripeReadState, Datum *columnValues,
 	{
 		if (stripeReadState->chunkGroupReadState == NULL)
 		{
+			/*
+			 * Fast path: if every row in this chunk group has been deleted,
+			 * skip it entirely without decompressing column data or loading
+			 * the row mask.
+			 */
+			if (columnar_enable_dml)
+			{
+				uint32 chunkRowCount =
+					stripeReadState->stripeBuffers->selectedChunkGroupRowCounts[stripeReadState->chunkGroupIndex];
+				uint32 chunkDeletedRows =
+					stripeReadState->stripeBuffers->selectedChunkGroupDeletedRows[stripeReadState->chunkGroupIndex];
+
+				if (chunkDeletedRows > 0 && chunkDeletedRows >= chunkRowCount)
+				{
+					stripeReadState->currentRow += chunkRowCount;
+
+					if (stripeReadState->currentRow >= stripeReadState->rowCount)
+						return false;
+
+					stripeReadState->chunkGroupIndex++;
+					continue;
+				}
+			}
+
 			stripeReadState->chunkGroupReadState = BeginChunkGroupRead(
 				stripeReadState->stripeBuffers,
 				stripeReadState->
@@ -941,12 +965,12 @@ ReadStripeNextRow(StripeReadState *stripeReadState, Datum *columnValues,
 				stripeReadState,
 				stripeId
 				);
-			
+
 			if (columnar_enable_dml &&
 				stripeReadState->chunkGroupReadState->chunkGroupDeletedRows != 0)
 			{
-				uint64 chunkFirstRowNumber = 
-					stripeFirstRowNumber + 
+				uint64 chunkFirstRowNumber =
+					stripeFirstRowNumber +
 					stripeReadState->chunkGroupReadState->chunkStripeRowOffset;
 				stripeReadState->chunkGroupReadState->rowMask =
 					ReadChunkRowMaskByRelation(stripeReadState->relation,
@@ -2073,6 +2097,33 @@ ReadStripeNextVector(StripeReadState *stripeReadState, Datum *columnValues,
 
 		if (stripeReadState->chunkGroupReadState == NULL)
 		{
+			/*
+			 * Fast path: if every row in this chunk group has been deleted,
+			 * skip it entirely without decompressing column data or loading
+			 * the row mask.
+			 */
+			if (columnar_enable_dml)
+			{
+				uint32 chunkRowCount =
+					stripeReadState->stripeBuffers->selectedChunkGroupRowCounts[stripeReadState->chunkGroupIndex];
+				uint32 chunkDeletedRows =
+					stripeReadState->stripeBuffers->selectedChunkGroupDeletedRows[stripeReadState->chunkGroupIndex];
+
+				if (chunkDeletedRows > 0 && chunkDeletedRows >= chunkRowCount)
+				{
+					stripeReadState->currentRow += chunkRowCount;
+
+					if (stripeReadState->currentRow >= stripeReadState->rowCount)
+					{
+						pfree(columnValueOffset);
+						return false;
+					}
+
+					stripeReadState->chunkGroupIndex++;
+					continue;
+				}
+			}
+
 			stripeReadState->chunkGroupReadState = BeginChunkGroupRead(
 				stripeReadState->stripeBuffers,
 				stripeReadState->

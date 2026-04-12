@@ -27,6 +27,9 @@
 #include "catalog/pg_statistic.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
+#if PG_VERSION_NUM >= PG_VERSION_18
+#include "commands/explain_format.h"
+#endif
 #include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
@@ -178,10 +181,8 @@ static void Columnar_InitializeWorkerCustomScan(CustomScanState *node,
 static const char * ColumnarPushdownClausesStr(List *context, List *clauses);
 static const char * ColumnarProjectedColumnsStr(List *context,
 												List *projectedColumns);
-#if PG_VERSION_NUM >= 130000
 static List * set_deparse_context_planstate(List *dpcontext, Node *node,
 											List *ancestors);
-#endif
 
 /* other helpers */
 static List * ColumnarVarNeeded(ColumnarScanState *columnarScanState);
@@ -2504,7 +2505,12 @@ ColumnarScan_EndCustomScan(CustomScanState *node)
 	/*
 	 * Free the exprcontext
 	 */
+#if PG_VERSION_NUM >= PG_VERSION_18
+	if (node->ss.ps.ps_ExprContext)
+		FreeExprContext(node->ss.ps.ps_ExprContext, true);
+#else
 	ExecFreeExprContext(&node->ss.ps);
+#endif
 
 	/*
 	 * clean out the tuple table
@@ -2835,10 +2841,8 @@ ColumnarVarNeeded(ColumnarScanState *columnarScanState)
 }
 
 
-#if PG_VERSION_NUM >= 130000
-
 /*
- * set_deparse_context_planstate is a compatibility wrapper for versions 13+.
+ * set_deparse_context_planstate is a compatibility wrapper.
  */
 static List *
 set_deparse_context_planstate(List *dpcontext, Node *node, List *ancestors)
@@ -2846,6 +2850,3 @@ set_deparse_context_planstate(List *dpcontext, Node *node, List *ancestors)
 	PlanState *ps = (PlanState *) node;
 	return set_deparse_context_plan(dpcontext, ps->plan, ancestors);
 }
-
-
-#endif
