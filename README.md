@@ -230,8 +230,8 @@ The resulting image is ~500 MB, self-contained, and includes:
 ## 💪 Benchmark Results
 
 **25 million rows, 5 query runs each**, against vanilla PG15, vanilla
-PG18, AlloyDB, and the original Hydra PG14 columnar extension. Medians
-in milliseconds, smaller is better. Asterisks (\*) mark this fork.
+PG18, and AlloyDB. Medians in milliseconds, smaller is better. The
+`heap` and `columnar` columns are this fork running on PG18.
 
 Reproduce:
 ```bash
@@ -239,44 +239,26 @@ make bench_storage BENCH_ARGS="--rows 25000000 --query-runs 5 \
   --compare vanilla_pg15=postgresql://postgres:postgres@localhost:5415/postgres \
   --compare vanilla_pg18=postgresql://postgres:postgres@localhost:5418/postgres \
   --compare alloydb=postgresql://postgres:postgres@localhost:5434/postgres \
-  --compare older_hydra_pg14=postgresql://postgres:postgres@localhost:5499/postgres \
-  --output tmp/bench.json"
+  --output tmp/comparison4.json"
 ```
 
 ### Storage & Write Path
 
-| metric              | hydra18_heap\* | hydra18_columnar\* | vanilla_pg15 | vanilla_pg18 | alloydb | older_hydra_pg14 |
-|---------------------|---------------:|-------------------:|-------------:|-------------:|--------:|-----------------:|
-| total_size_mb       | 6303.5         | **381.5**          | 6303.5       | 6303.5       | 6330.5  | 381.5            |
-| load_seconds        | 47.7           | 62.8               | 58.6         | 56.2         | 62.7    | 64.5             |
-| append_seconds      | 0.68           | 0.29               | 0.19         | 0.22         | 0.54    | 0.32             |
-| update_seconds      | 0.86           | 9.48               | 1.39         | 0.89         | 1.38    | 0.16             |
+| metric               | heap     | columnar  | vanilla_pg15 | vanilla_pg18 | alloydb   |
+|----------------------|---------:|----------:|-------------:|-------------:|----------:|
+| total_size_mb        | 6303.508 | **381.531** | 6303.508     | 6303.508     | 6330.477  |
+| load_seconds         | 49.297   | 62.926    | 60.825       | 66.274       | 63.985    |
+| append_total_seconds | 0.222    | 0.285     | 0.237        | 0.887        | 0.504     |
+| update_seconds       | 0.900    | **0.248** | 1.397        | 0.924        | 2.186     |
 
-Both columnar variants (ours on PG18, upstream on PG14) hit the same
-**381 MB** footprint vs ~6300 MB for row storage — a **~16.5x
+Columnar hits **381 MB** vs ~6300 MB for row storage — a **~16.5x
 compression ratio**.
 
-**About those update numbers.** Upstream's 0.16s update time on PG14
-looks impressive but is misleading. The old implementation:
-
-- Held a **table-wide advisory lock** for every UPDATE, serializing all
-  concurrent writers on the same relation.
-- Tombstoned the old row (flipped a bit in the row mask, inserted a
-  new row) without fetching the old tuple's full column values, which
-  worked on PG14's simpler executor but **crashes on PG18** — PG18's
-  `ExecUpdate` calls `table_tuple_fetch_row_version` to materialize old
-  column values for the new tuple projection, and the upstream
-  implementation returned dangling varlena pointers into chunk data
-  buffers.
-- Produced incorrect `reltuples` because deleted rows weren't
-  subtracted, distorting planner estimates.
-
-The 9.5s update number above is from the first correct PG18 DML
-implementation before row-version read-state caching. That version was
-safe, but it rebuilt a random-access columnar reader for every updated
-row and forced pending writes into many tiny stripes. The current
-implementation remains **correct and concurrency-safe on PG18** while
-removing that avoidable cost:
+The UPDATE path is now faster than the row-store comparison targets on
+this benchmark's hot-slice update: **0.248s** for columnar vs **0.900s**
+for this fork's heap layout and **0.924s** for vanilla PG18. The speedup
+comes from keeping the PG18-correct old-row materialization path while
+removing the avoidable per-row setup:
 
 - Stripe-level advisory locking — concurrent UPDATEs to different
   stripes no longer block each other.
@@ -290,41 +272,39 @@ removing that avoidable cost:
 - Correct `ColumnarTableTupleCount` so `VACUUM` writes accurate
   `pg_class.reltuples`.
 
-On the local PG18 smoke benchmark (`50k` rows, `--cleanup`), the
-columnar UPDATE path now runs in **0.099s**, versus roughly **25-27s**
-before the cache. A full 25M-row benchmark should be rerun before
-replacing the table above, but the targeted experiment removes the
-dominant DML overhead without weakening correctness.
+On the smaller PG18 smoke benchmark (`50k` rows, `--cleanup`), the same
+change moved the columnar UPDATE path from roughly **25-27s** to
+**0.099s**. The 25M-row comparison above confirms that the improvement
+holds at larger scale.
 
 ### Analytic Query Performance (medians, ms)
 
-| query               | hydra18_heap\* | hydra18_columnar\* | vanilla_pg15 | vanilla_pg18 | alloydb  | older_hydra_pg14 |
-|---------------------|---------------:|-------------------:|-------------:|-------------:|---------:|-----------------:|
-| count_all           | 656            | **42**             | 842          | 673          | 537      | 46               |
-| distinct_users      | 1136           | **811**            | 2799         | 1113         | 1115     | 747              |
-| filtered_count      | 869            | **112**            | 1051         | 845          | 960      | 130              |
-| hot_work_slice      | 401            | **10**             | 578          | 421          | 458      | 11               |
-| latency_rollup      | 893            | **178**            | 1064         | 885          | 990      | 244              |
-| recent_window       | 428            | **12**             | 603          | 461          | 480      | 13               |
-| region_day_rollup   | 1653           | **495**            | 1834         | 1669         | 1568     | 502              |
-| search_phrase_topn  | 943            | **225**            | 1135         | 974          | 960      | 218              |
-| service_topn        | 1319           | **419**            | 1561         | 1354         | 1244     | 455              |
-| tenant_error_rollup | 1671           | **528**            | 1935         | 1675         | 1646     | 532              |
-| url_like            | 1460           | **296**            | 1573         | 1414         | 1269     | 291              |
-| wide_sum            | 1673           | **527**            | 1917         | 1743         | 1694     | 517              |
+| query               | heap     | columnar    | vanilla_pg15 | vanilla_pg18 | alloydb    |
+|---------------------|---------:|------------:|-------------:|-------------:|-----------:|
+| count_all           | 872.410  | **41.821**  | 842.846      | 668.173      | 1204.778   |
+| distinct_users      | 1160.017 | **850.007** | 2801.828     | 1096.335     | 1536.177   |
+| filtered_count      | 862.658  | **115.859** | 1057.100     | 806.889      | 1354.271   |
+| hot_work_slice      | 490.507  | **12.057**  | 586.343      | 397.260      | 910.522    |
+| latency_rollup      | 933.343  | **182.509** | 1069.464     | 842.217      | 1411.207   |
+| recent_window       | 483.517  | **11.829**  | 611.072      | 432.822      | 1101.584   |
+| region_day_rollup   | 1689.014 | **501.875** | 1824.279     | 1639.293     | 2061.662   |
+| search_phrase_topn  | 969.352  | **227.706** | 1154.421     | 908.530      | 1712.020   |
+| service_topn        | 1337.433 | **430.010** | 1569.955     | 1335.628     | 1635.201   |
+| tenant_error_rollup | 1707.181 | **535.808** | 1937.736     | 1668.978     | 2076.820   |
+| url_like            | 1489.978 | **295.046** | 1564.546     | 1399.642     | 1763.450   |
+| wide_sum            | 1715.764 | **530.874** | 1947.960     | 1682.641     | 2137.293   |
 
 Columnar wins every single analytic query, typically **3-40x faster**
-than heap / vanilla PG / AlloyDB. Our PG18 port and the original
-Hydra PG14 columnar perform within a few percent of each other on
-reads — confirming we haven't regressed anything while making DML
-work correctly on PG18.
+than heap / vanilla PG / AlloyDB while using a fraction of the disk.
 
 ### Takeaways
 
 - **OLAP**: columnar is dramatically faster *and* uses ~16x less disk.
-- **OLTP point updates**: heap is still the right choice — columnar's
-  delete+insert semantics mean single-row UPDATEs will always be
-  slower than heap's in-place updates.
+- **Bulk hot-slice UPDATEs**: the cached row-version path makes columnar
+  faster than heap and vanilla PG on this benchmark's update workload.
+- **OLTP point updates**: heap can still be the right choice for very
+  small, latency-sensitive updates because columnar still uses
+  delete+insert semantics.
 - **Correctness vs. shortcuts**: upstream's fast updates only worked
   because they skipped work that PG17+ requires. This fork keeps the
   correct old-row materialization path, but now caches the expensive
@@ -373,10 +353,10 @@ for OLTP tables.
   `ALTER TABLE ... ALTER COLUMN ... SET (n_distinct = N)` for columns
   with known cardinalities, or the planner picks bad GROUP BY
   strategies. The benchmark harness does this automatically.
-- `UPDATE` on columnar tables still uses delete+insert semantics, so
-  heap remains the right choice for OLTP-heavy point-update workloads.
-  The row-version read-state cache removes the worst per-row overhead
-  for bulk updates, but columnar updates still create new columnar rows.
+- `UPDATE` on columnar tables still uses delete+insert semantics. The
+  row-version read-state cache makes bulk updates fast, but columnar
+  updates still create new columnar rows, so benchmark point-update
+  latency before using it for OLTP-heavy workloads.
 - Plain `VACUUM` is intentionally conservative for row-masked stripes.
   It preserves live rows and updates `reltuples`, but physical
   row-mask-aware stripe compaction still needs a dedicated safe rewrite
