@@ -71,6 +71,7 @@ typedef struct StripeReadState
 	MemoryContext stripeReadContext;
 	StripeBuffers *stripeBuffers;   /* allocated in stripeReadContext */
 	List *projectedColumnList;      /* borrowed reference */
+	ColumnarReadStats *stats;      /* borrowed reference */
 	ChunkGroupReadState *chunkGroupReadState; /* owned */
 } StripeReadState;
 
@@ -93,6 +94,7 @@ struct ColumnarReadState
 
 	MemoryContext stripeReadContext;
 	int64 chunkGroupsFiltered;
+	ColumnarReadStats stats;
 
 	/*
 	 * Memory context guaranteed to be not freed during scan so we can
@@ -128,7 +130,7 @@ static StripeReadState * BeginStripeRead(StripeMetadata *stripeMetadata, Relatio
 										 TupleDesc tupleDesc, List *projectedColumnList,
 										 List *whereClauseList, List *whereClauseVars,
 										 MemoryContext stripeReadContext,
-										 Snapshot snapshot);
+										 Snapshot snapshot, ColumnarReadStats *stats);
 static void AdvanceStripeRead(ColumnarReadState *readState);
 static bool SnapshotMightSeeUnflushedStripes(Snapshot snapshot);
 static bool ReadStripeNextRow(StripeReadState *stripeReadState, Datum *columnValues,
@@ -152,11 +154,13 @@ static StripeBuffers * LoadFilteredStripeBuffers(Relation relation,
 												 List *whereClauseList,
 												 List *whereClauseVars,
 												 int64 *chunkGroupsFiltered,
-												 Snapshot snapshot);
+												 Snapshot snapshot,
+												 ColumnarReadStats *stats);
 static ColumnBuffers * LoadColumnBuffers(Relation relation,
 										 ColumnChunkSkipNode *chunkSkipNodeArray,
 										 uint32 chunkCount, uint64 stripeOffset,
-										 Form_pg_attribute attributeForm);
+										 Form_pg_attribute attributeForm,
+										 ColumnarReadStats *stats);
 static bool * SelectedChunkMask(StripeSkipList *stripeSkipList,
 								List *whereClauseList, List *whereClauseVars,
 								int64 *chunkGroupsFiltered);
@@ -350,7 +354,9 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *columnValues, bool *col
 														 readState->whereClauseList,
 														 readState->whereClauseVars,
 														 readState->stripeReadContext,
-														 readState->snapshot);
+														 readState->snapshot,
+														 columnar_enable_scan_diagnostics ?
+														 &readState->stats : NULL);
 		}
 
 		if (!ReadStripeNextRow(readState->stripeReadState, columnValues, columnNulls,
@@ -445,7 +451,9 @@ ColumnarReadRowByRowNumber(ColumnarReadState *readState,
 													 whereClauseList,
 													 whereClauseVars,
 													 stripeReadContext,
-													 snapshot);
+													 snapshot,
+													 columnar_enable_scan_diagnostics ?
+													 &readState->stats : NULL);
 
 		readState->currentStripeMetadata = stripeMetadata;
 	}
@@ -499,7 +507,9 @@ ColumnarSetStripeReadState(ColumnarReadState *readState,
 													 whereClauseList,
 													 whereClauseVars,
 													 stripeReadContext,
-													 snapshot);
+													 snapshot,
+													 columnar_enable_scan_diagnostics ?
+													 &readState->stats : NULL);
 
 		readState->currentStripeMetadata = stripeMetadata;
 	}
@@ -720,6 +730,7 @@ ColumnarRescan(ColumnarReadState *readState, List *scanQual)
 	AdvanceStripeRead(readState);
 
 	readState->chunkGroupsFiltered = 0;
+	memset(&readState->stats, 0, sizeof(ColumnarReadStats));
 
 	readState->whereClauseList = copyObject(scanQual);
 	MemoryContextSwitchTo(oldContext);
@@ -777,7 +788,8 @@ ColumnarResetRead(ColumnarReadState *readState)
 static StripeReadState *
 BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDesc,
 				List *projectedColumnList, List *whereClauseList, List *whereClauseVars,
-				MemoryContext stripeReadContext, Snapshot snapshot)
+				MemoryContext stripeReadContext, Snapshot snapshot,
+				ColumnarReadStats *stats)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(stripeReadContext);
 
@@ -788,7 +800,12 @@ BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDes
 	stripeReadState->columnCount = tupleDesc->natts;
 	stripeReadState->chunkGroupReadState = NULL;
 	stripeReadState->projectedColumnList = projectedColumnList;
+	stripeReadState->stats = stats;
 	stripeReadState->stripeReadContext = stripeReadContext;
+	if (stats != NULL)
+	{
+		stats->stripesRead++;
+	}
 
 	stripeReadState->stripeBuffers = LoadFilteredStripeBuffers(rel,
 															   stripeMetadata,
@@ -796,9 +813,9 @@ BeginStripeRead(StripeMetadata *stripeMetadata, Relation rel, TupleDesc tupleDes
 															   projectedColumnList,
 															   whereClauseList,
 															   whereClauseVars,
-															   &stripeReadState->
-															   chunkGroupsFiltered,
-															   snapshot);
+															   &stripeReadState->chunkGroupsFiltered,
+															   snapshot,
+															   stats);
 
 	stripeReadState->rowCount = stripeReadState->stripeBuffers->rowCount;
 
@@ -1067,6 +1084,10 @@ BeginChunkGroupRead(StripeBuffers *stripeBuffers, int chunkIndex, TupleDesc tupl
 															   chunkGroupRowCount,
 															   tupleDesc,
 															   projectedColumnList, state, stripeId);
+	if (state->stats != NULL)
+	{
+		state->stats->chunkGroupsDeserialized++;
+	}
 	MemoryContextSwitchTo(oldContext);
 
 	return chunkGroupReadState;
@@ -1157,6 +1178,13 @@ ColumnarReadChunkGroupsFiltered(ColumnarReadState *state)
 }
 
 
+ColumnarReadStats *
+ColumnarReadStatsPtr(ColumnarReadState *state)
+{
+	return &state->stats;
+}
+
+
 /*
  * CreateEmptyChunkDataArray creates data buffers to keep deserialized exist and
  * value arrays for requested columns in columnMask.
@@ -1221,6 +1249,7 @@ FreeChunkData(ChunkData *chunkData)
 
 	pfree(chunkData->existsArray);
 	pfree(chunkData->valueArray);
+	pfree(chunkData->valueBufferArray);
 	pfree(chunkData);
 }
 
@@ -1300,7 +1329,8 @@ static StripeBuffers *
 LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 						  TupleDesc tupleDescriptor, List *projectedColumnList,
 						  List *whereClauseList, List *whereClauseVars,
-						  int64 *chunkGroupsFiltered, Snapshot snapshot)
+						  int64 *chunkGroupsFiltered, Snapshot snapshot,
+						  ColumnarReadStats *stats)
 {
 	uint32 columnIndex = 0;
 	uint32 columnCount = tupleDescriptor->natts;
@@ -1318,6 +1348,10 @@ LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 	StripeSkipList *selectedChunkSkipList =
 		SelectedChunkSkipList(stripeSkipList, projectedColumnMask,
 							  selectedChunkMask);
+	if (stats != NULL)
+	{
+		stats->chunkGroupsSelected += selectedChunkSkipList->chunkCount;
+	}
 
 	/* load column data for projected columns */
 	ColumnBuffers **columnBuffersArray = palloc0(columnCount * sizeof(ColumnBuffers *));
@@ -1334,7 +1368,8 @@ LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 			ColumnBuffers *columnBuffers = LoadColumnBuffers(relation, chunkSkipNode,
 															 chunkCount,
 															 stripeMetadata->fileOffset,
-															 attributeForm);
+															 attributeForm,
+															 stats);
 
 			columnBuffersArray[columnIndex] = columnBuffers;
 		}
@@ -1364,7 +1399,8 @@ LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 static ColumnBuffers *
 LoadColumnBuffers(Relation relation, ColumnChunkSkipNode *chunkSkipNodeArray,
 				  uint32 chunkCount, uint64 stripeOffset,
-				  Form_pg_attribute attributeForm)
+				  Form_pg_attribute attributeForm,
+				  ColumnarReadStats *stats)
 {
 	uint32 chunkIndex = 0;
 	ColumnChunkBuffers **chunkBuffersArray =
@@ -1373,6 +1409,11 @@ LoadColumnBuffers(Relation relation, ColumnChunkSkipNode *chunkSkipNodeArray,
 	for (chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++)
 	{
 		chunkBuffersArray[chunkIndex] = palloc0(sizeof(ColumnChunkBuffers));
+	}
+	if (stats != NULL)
+	{
+		stats->columnsLoaded++;
+		stats->columnChunksLoaded += chunkCount;
 	}
 
 	/*
@@ -1390,6 +1431,10 @@ LoadColumnBuffers(Relation relation, ColumnChunkSkipNode *chunkSkipNodeArray,
 		rawExistsBuffer->len = chunkSkipNode->existsLength;
 		ColumnarStorageRead(relation, existsOffset, rawExistsBuffer->data,
 							chunkSkipNode->existsLength);
+		if (stats != NULL)
+		{
+			stats->existsBytesRead += chunkSkipNode->existsLength;
+		}
 
 		chunkBuffersArray[chunkIndex]->existsBuffer = rawExistsBuffer;
 	}
@@ -1406,6 +1451,10 @@ LoadColumnBuffers(Relation relation, ColumnChunkSkipNode *chunkSkipNodeArray,
 		rawValueBuffer->len = chunkSkipNode->valueLength;
 		ColumnarStorageRead(relation, valueOffset, rawValueBuffer->data,
 							chunkSkipNode->valueLength);
+		if (stats != NULL)
+		{
+			stats->valueBytesRead += chunkSkipNode->valueLength;
+		}
 
 		chunkBuffersArray[chunkIndex]->valueBuffer = rawValueBuffer;
 		chunkBuffersArray[chunkIndex]->valueCompressionType = compressionType;
@@ -1930,22 +1979,28 @@ DeserializeChunkData(StripeBuffers *stripeBuffers, uint64 chunkIndex,
 		{
 			ColumnChunkBuffers *chunkBuffers =
 				columnBuffers->chunkBuffersArray[chunkIndex];
-				bool shouldCache = columnar_enable_page_cache == true && chunkBuffers->valueCompressionType != COMPRESSION_NONE;
+			bool shouldCache = columnar_enable_page_cache == true &&
+							   chunkBuffers->valueCompressionType != COMPRESSION_NONE;
+			if (state->stats != NULL)
+			{
+				state->stats->columnChunksDeserialized++;
+			}
 
-				if (shouldCache)
-				{
-					ColumnarMarkChunkGroupInUse((uint64) (uintptr_t) state,
-											   state->relation->rd_id,
-											   stripeId,
-											   chunkIndex);
-				}
+			if (shouldCache)
+			{
+				ColumnarMarkChunkGroupInUse((uint64) (uintptr_t) state,
+											state->relation->rd_id,
+											stripeId,
+											chunkIndex);
+			}
 
 			/* decompress and deserialize current chunk's data */
 			StringInfo valueBuffer = NULL;
 			
 			if (shouldCache)
 			{
-				valueBuffer = ColumnarRetrieveCache(state->relation->rd_id, stripeId, chunkIndex, columnIndex);
+				valueBuffer = ColumnarRetrieveCache(state->relation->rd_id, stripeId,
+												   chunkIndex, columnIndex);
 			}
 
 			if (valueBuffer == NULL)
@@ -1959,6 +2014,11 @@ DeserializeChunkData(StripeBuffers *stripeBuffers, uint64 chunkIndex,
 				valueBuffer = DecompressBuffer(chunkBuffers->valueBuffer,
 								 chunkBuffers->valueCompressionType,
 								 chunkBuffers->decompressedValueSize);
+				if (state->stats != NULL)
+				{
+					state->stats->valueBytesDecompressed +=
+						chunkBuffers->decompressedValueSize;
+				}
 
 				if (shouldCache)
 				{
@@ -1981,6 +2041,11 @@ DeserializeChunkData(StripeBuffers *stripeBuffers, uint64 chunkIndex,
 		}
 		else if (columnAdded)
 		{
+			if (state->stats != NULL)
+			{
+				state->stats->columnChunksDeserialized++;
+			}
+
 			/*
 			 * This is a column that was added after creation of this stripe.
 			 * So we use either the default value or NULL.
@@ -2072,7 +2137,9 @@ ColumnarReadNextVector(ColumnarReadState *readState,  Datum *columnValues,
 														 readState->whereClauseList,
 														 readState->whereClauseVars,
 														 readState->stripeReadContext,
-														 readState->snapshot);
+														 readState->snapshot,
+														 columnar_enable_scan_diagnostics ?
+														 &readState->stats : NULL);
 		}
 
 		if (!ReadStripeNextVector(readState->stripeReadState, columnValues, columnNulls, 

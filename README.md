@@ -138,6 +138,22 @@ The `bench/` harness was simplified and updated:
   which would otherwise make the planner pick Sort+GroupAggregate
   instead of HashAggregate on GROUP BY queries
 
+For reader/storage experiments, `columnar.enable_scan_diagnostics` can be
+enabled for `EXPLAIN ANALYZE`. It is off by default and reports per-scan
+vector filter selectivity, selected/deserialized chunk groups, loaded
+column chunks, compressed bytes read, and decompressed value bytes. When
+using it to reason about storage-layer work, disable parallel columnar
+execution so the counters describe a single scan node:
+
+```sql
+SET columnar.enable_parallel_execution = off;
+SET columnar.enable_scan_diagnostics = on;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT ...
+FROM my_columnar_table
+WHERE ...;
+```
+
 Example:
 ```bash
 make bench_storage BENCH_ARGS="--rows 1000000 --query-runs 3 \

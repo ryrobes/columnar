@@ -48,6 +48,7 @@ int columnar_min_parallel_processes = 8;
 bool columnar_enable_vectorization = true;
 bool columnar_enable_dml = true;
 bool columnar_enable_page_cache = false;
+bool columnar_enable_scan_diagnostics = false;
 int columnar_page_cache_size = 200U;
 bool columnar_index_scan = false;
 
@@ -180,6 +181,17 @@ columnar_guc_init()
 							false,
 							PGC_USERSET,
 							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomBoolVariable("columnar.enable_scan_diagnostics",
+							"Enables columnar scan diagnostics in EXPLAIN ANALYZE.",
+							NULL,
+							&columnar_enable_scan_diagnostics,
+							false,
+							PGC_USERSET,
+							GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 							NULL,
 							NULL,
 							NULL);

@@ -3022,6 +3022,23 @@ ColumnarScanChunkGroupsFiltered(ColumnarScanDesc columnarScanDesc)
 }
 
 
+ColumnarReadStats *
+ColumnarScanReadStats(ColumnarScanDesc columnarScanDesc)
+{
+	ColumnarReadState *readState = columnarScanDesc->cs_readState;
+
+	/* readState is initialized lazily */
+	if (readState != NULL)
+	{
+		return ColumnarReadStatsPtr(readState);
+	}
+	else
+	{
+		return NULL;
+	}
+}
+
+
 /*
  * Implementation of TupleTableSlotOps.copy_heap_tuple for TTSOpsColumnar.
  */

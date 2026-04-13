@@ -95,6 +95,9 @@ typedef struct ColumnarScanState
 		List *vectorizedQualList;
 		List *constructedVectorizedQualList;
 		List *attrNeededList;
+		uint64 vectorBatches;
+		uint64 vectorRowsScanned;
+		uint64 vectorRowsKept;
 	} vectorization;
 
 	/* Scan snapshot*/
@@ -2294,7 +2297,23 @@ CustomExecScan(ColumnarScanState *columnarScanState,
 										columnarScanState->vectorization.constructedVectorizedQualList,
 										AND_EXPR, econtext);
 
-				memcpy(vectorSlot->keep, resultQual, COLUMNAR_VECTOR_COLUMN_SIZE);
+				uint32 vectorSize = vectorSlot->dimension;
+				memcpy(vectorSlot->keep, resultQual, vectorSize * sizeof(bool));
+				if (columnar_enable_scan_diagnostics)
+				{
+					uint32 keptRows = 0;
+					for (uint32 vectorIndex = 0; vectorIndex < vectorSize; vectorIndex++)
+					{
+						if (resultQual[vectorIndex])
+						{
+							keptRows++;
+						}
+					}
+
+					columnarScanState->vectorization.vectorBatches++;
+					columnarScanState->vectorization.vectorRowsScanned += vectorSize;
+					columnarScanState->vectorization.vectorRowsKept += keptRows;
+				}
 			}
 			/*
 			 * No qual, no vectorized qual, no projection but we need to return vector
@@ -2548,6 +2567,9 @@ ColumnarScan_ReScanCustomScan(CustomScanState *node)
 	List *allClauses = lsecond(cscan->custom_exprs);
 	columnarScanState->qual = (List *) EvalParamsMutator(
 		(Node *) allClauses, columnarScanState->css_RuntimeContext);
+	columnarScanState->vectorization.vectorBatches = 0;
+	columnarScanState->vectorization.vectorRowsScanned = 0;
+	columnarScanState->vectorization.vectorRowsKept = 0;
 
 	TableScanDesc scanDesc = node->ss.ss_currentScanDesc;
 
@@ -2577,6 +2599,8 @@ ColumnarScan_ExplainCustomScan(CustomScanState *node, List *ancestors,
 						projectedColumnsStr, es);
 
 	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
+	ColumnarScanDesc columnarScanDesc =
+		(ColumnarScanDesc) node->ss.ss_currentScanDesc;
 	List *chunkGroupFilter = lsecond(cscan->custom_exprs);
 	if (chunkGroupFilter != NULL)
 	{
@@ -2585,8 +2609,6 @@ ColumnarScan_ExplainCustomScan(CustomScanState *node, List *ancestors,
 		ExplainPropertyText("Columnar Chunk Group Filters",
 							pushdownClausesStr, es);
 
-		ColumnarScanDesc columnarScanDesc =
-			(ColumnarScanDesc) node->ss.ss_currentScanDesc;
 		if (columnarScanDesc != NULL)
 		{
 			ExplainPropertyInteger(
@@ -2602,6 +2624,57 @@ ColumnarScan_ExplainCustomScan(CustomScanState *node, List *ancestors,
 					context, columnarScanState->vectorization.vectorizedQualList);
 		ExplainPropertyText("Columnar Vectorized Filter", 
 							vectorizedWhereClauses, es);
+
+		if (es->analyze && columnar_enable_scan_diagnostics)
+		{
+			uint64 vectorRowsScanned =
+				columnarScanState->vectorization.vectorRowsScanned;
+			uint64 vectorRowsKept =
+				columnarScanState->vectorization.vectorRowsKept;
+
+			ExplainPropertyUInteger("Columnar Vector Batches",
+									NULL,
+									columnarScanState->vectorization.vectorBatches,
+									es);
+			ExplainPropertyUInteger("Columnar Vector Rows Scanned",
+									NULL, vectorRowsScanned, es);
+			ExplainPropertyUInteger("Columnar Vector Rows Kept",
+									NULL, vectorRowsKept, es);
+			if (vectorRowsScanned > 0)
+			{
+				ExplainPropertyFloat("Columnar Vector Selectivity",
+									 "%",
+									 (100.0 * vectorRowsKept) / vectorRowsScanned,
+									 2,
+									 es);
+			}
+		}
+	}
+
+	if (es->analyze && columnar_enable_scan_diagnostics && columnarScanDesc != NULL)
+	{
+		ColumnarReadStats *readStats = ColumnarScanReadStats(columnarScanDesc);
+		if (readStats != NULL)
+		{
+			ExplainPropertyUInteger("Columnar Read Stripes",
+									NULL, readStats->stripesRead, es);
+			ExplainPropertyUInteger("Columnar Read Chunk Groups Selected",
+									NULL, readStats->chunkGroupsSelected, es);
+			ExplainPropertyUInteger("Columnar Read Chunk Groups Deserialized",
+									NULL, readStats->chunkGroupsDeserialized, es);
+			ExplainPropertyUInteger("Columnar Read Columns Loaded",
+									NULL, readStats->columnsLoaded, es);
+			ExplainPropertyUInteger("Columnar Read Column Chunks Loaded",
+									NULL, readStats->columnChunksLoaded, es);
+			ExplainPropertyUInteger("Columnar Read Column Chunks Deserialized",
+									NULL, readStats->columnChunksDeserialized, es);
+			ExplainPropertyUInteger("Columnar Read Exists Bytes",
+									"bytes", readStats->existsBytesRead, es);
+			ExplainPropertyUInteger("Columnar Read Value Bytes",
+									"bytes", readStats->valueBytesRead, es);
+			ExplainPropertyUInteger("Columnar Read Decompressed Value Bytes",
+									"bytes", readStats->valueBytesDecompressed, es);
+		}
 	}
 
 	if (columnar_enable_page_cache)

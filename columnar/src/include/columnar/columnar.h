@@ -191,6 +191,20 @@ typedef struct StripeBuffers
 } StripeBuffers;
 
 
+typedef struct ColumnarReadStats
+{
+	uint64 stripesRead;
+	uint64 chunkGroupsSelected;
+	uint64 chunkGroupsDeserialized;
+	uint64 columnsLoaded;
+	uint64 columnChunksLoaded;
+	uint64 existsBytesRead;
+	uint64 valueBytesRead;
+	uint64 valueBytesDecompressed;
+	uint64 columnChunksDeserialized;
+} ColumnarReadStats;
+
+
 /* return value of StripeWriteState to decide stripe write state */
 typedef enum StripeWriteStateEnum
 {
@@ -262,6 +276,7 @@ extern int columnar_min_parallel_processes;
 extern bool columnar_enable_vectorization;
 extern bool columnar_enable_dml;
 extern bool columnar_enable_page_cache;
+extern bool columnar_enable_scan_diagnostics;
 extern int columnar_page_cache_size;
 extern bool columnar_index_scan;
 
@@ -306,6 +321,7 @@ extern bool ColumnarReadNextVector(ColumnarReadState *readState, Datum *columnVa
 								   bool *columnNulls, uint64 *rowNumber,
 								   int *newVectorSize);
 extern int64 ColumnarReadChunkGroupsFiltered(ColumnarReadState *state);
+extern ColumnarReadStats * ColumnarReadStatsPtr(ColumnarReadState *state);
 extern void ColumnarRescan(ColumnarReadState *readState, List *scanQual);
 
 /* functions only applicable for random access */
