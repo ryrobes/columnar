@@ -1,4 +1,4 @@
-[![Hydra - the open source data warehouse](https://raw.githubusercontent.com/hydradatabase/hydra/main/.images/header.png)](https://hydra.so)
+[![Hydra - the open source data warehouse](https://raw.githubusercontent.com/header.png)]
 
 # 🐘🤘 Hydra Columnar (PG18 Fork)
 
