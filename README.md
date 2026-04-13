@@ -146,6 +146,10 @@ The `bench/` harness was simplified and updated:
   `image_pgvector_baseline` builds vanilla PG15/PG18 + pgvector, and
   `image_pgvectorscale_baseline` builds an optional PG18 +
   pgvectorscale image for DiskANN experiments.
+- Added ClickHouse benchmark support. `--compare-clickhouse label=url`
+  runs the same synthetic workload against a ClickHouse HTTP endpoint
+  using a native `MergeTree` table, and the `Makefile` includes local
+  start/stop and smoke/25M benchmark targets.
 
 For reader/storage experiments, `columnar.enable_scan_diagnostics` can be
 enabled for `EXPLAIN ANALYZE`. It is off by default and reports per-scan
@@ -321,6 +325,53 @@ holds at larger scale.
 
 Columnar wins every single analytic query, typically **3-40x faster**
 than heap / vanilla PG / AlloyDB while using a fraction of the disk.
+
+### ClickHouse Comparison
+
+Measured against `clickhouse/clickhouse-server:25.3`
+(ClickHouse 25.3.14.14) over HTTP. The benchmark creates a native
+`MergeTree` table with `ORDER BY event_id`, loads the same synthetic
+rows, runs the same analytical query templates, and times ClickHouse
+queries with `FORMAT Null`. PostgreSQL timings use `EXPLAIN ANALYZE`, so
+the ClickHouse numbers include HTTP round-trip overhead.
+
+Reproduce:
+```bash
+make clickhouse_bench_start
+make bench_storage_clickhouse_25m
+```
+
+25 million rows, 3 query runs each:
+
+| metric               | columnar | clickhouse |
+|----------------------|---------:|-----------:|
+| total_size_mb        | 381.531  | 824.585    |
+| load_seconds         | 69.938   | 9.116      |
+| append_total_seconds | 0.236    | 0.061      |
+| update_seconds       | 0.277    | 1.398      |
+
+| query               | columnar | clickhouse |
+|---------------------|---------:|-----------:|
+| count_all           | 71.725   | 2.810      |
+| distinct_users      | 945.884  | 174.327    |
+| filtered_count      | 204.053  | 26.500     |
+| hot_work_slice      | 12.136   | 13.155     |
+| latency_rollup      | 285.409  | 40.740     |
+| recent_window       | 18.770   | 19.578     |
+| region_day_rollup   | 745.971  | 93.131     |
+| search_phrase_topn  | 374.358  | 115.689    |
+| service_topn        | 536.723  | 39.862     |
+| tenant_error_rollup | 672.875  | 129.698    |
+| url_like            | 423.642  | 122.746    |
+| wide_sum            | 711.325  | 9.609      |
+
+ClickHouse is much faster on almost every read query and loads data much
+faster. This fork's columnar storage is denser on this workload and its
+hot-slice UPDATE path is faster than ClickHouse's synchronous mutation.
+So the honest comparison is: ClickHouse is the read-performance target
+to chase, while this fork is currently strongest when the goal is
+PostgreSQL compatibility, compact storage, and transactional DML inside
+Postgres.
 
 ### Upstream Hydra PG14 Comparison
 

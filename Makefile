@@ -131,6 +131,13 @@ lint_fix_acceptance:
 
 BENCH_DSN ?= postgresql://postgres:postgres@127.0.0.1:5432/postgres
 BENCH_ARGS ?=
+CLICKHOUSE_IMAGE ?= clickhouse/clickhouse-server:25.3
+CLICKHOUSE_CONTAINER ?= clickhouse_bench
+CLICKHOUSE_USER ?= default
+CLICKHOUSE_PASSWORD ?= clickhouse
+CLICKHOUSE_HTTP_PORT ?= 8123
+CLICKHOUSE_TCP_PORT ?= 9000
+CLICKHOUSE_DSN ?= http://$(CLICKHOUSE_USER):$(CLICKHOUSE_PASSWORD)@127.0.0.1:$(CLICKHOUSE_HTTP_PORT)/default
 
 .PHONY: bench_storage
 bench_storage:
@@ -139,6 +146,38 @@ bench_storage:
 .PHONY: bench_storage_smoke
 bench_storage_smoke:
 	python3 bench/local_storage_benchmark.py --dsn "$(BENCH_DSN)" --rows 50000 --query-runs 1 --append-batches 3 --append-rows 1000 $(BENCH_ARGS)
+
+.PHONY: clickhouse_bench_start
+clickhouse_bench_start:
+	-docker rm -f $(CLICKHOUSE_CONTAINER) >/dev/null 2>&1
+	docker run -d --name $(CLICKHOUSE_CONTAINER) \
+		--ulimit nofile=262144:262144 \
+		-e CLICKHOUSE_USER=$(CLICKHOUSE_USER) \
+		-e CLICKHOUSE_PASSWORD=$(CLICKHOUSE_PASSWORD) \
+		-e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+		-p $(CLICKHOUSE_HTTP_PORT):8123 \
+		-p $(CLICKHOUSE_TCP_PORT):9000 \
+		$(CLICKHOUSE_IMAGE)
+
+.PHONY: clickhouse_bench_stop
+clickhouse_bench_stop:
+	docker rm -f $(CLICKHOUSE_CONTAINER)
+
+.PHONY: bench_storage_clickhouse_smoke
+bench_storage_clickhouse_smoke:
+	python3 bench/local_storage_benchmark.py --dsn "$(BENCH_DSN)" \
+		--rows 50000 --query-runs 1 --append-batches 1 --append-rows 1000 \
+		--compare-clickhouse clickhouse=$(CLICKHOUSE_DSN) \
+		$(BENCH_ARGS)
+
+.PHONY: bench_storage_clickhouse_25m
+bench_storage_clickhouse_25m:
+	python3 bench/local_storage_benchmark.py --dsn "$(BENCH_DSN)" \
+		--layouts columnar --rows 25000000 --query-runs 3 \
+		--append-batches 5 --append-rows 10000 \
+		--compare-clickhouse clickhouse=$(CLICKHOUSE_DSN) \
+		--output tmp/clickhouse-25m.json \
+		$(BENCH_ARGS)
 
 VECTOR_BENCH_ARGS ?=
 PG_MAJOR ?= 18

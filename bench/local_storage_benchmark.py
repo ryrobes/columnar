@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 
 BASE_EVENT_TIME = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -49,6 +51,33 @@ TABLE_COLUMNS = textwrap.dedent(
     is_error boolean not null,
     is_refresh boolean not null,
     revenue_cents bigint not null
+    """
+).strip()
+
+CLICKHOUSE_TABLE_COLUMNS = textwrap.dedent(
+    """
+    event_id Int64,
+    work_id Int64,
+    tenant_id Int32,
+    event_time DateTime,
+    event_date Date,
+    user_id Int64,
+    session_id Int64,
+    region_id Int32,
+    service LowCardinality(String),
+    kind LowCardinality(String),
+    status Int32,
+    severity Int32,
+    device_type LowCardinality(String),
+    url String,
+    title String,
+    search_phrase String,
+    payload String,
+    payload_bytes Int32,
+    duration_ms Int32,
+    is_error UInt8,
+    is_refresh UInt8,
+    revenue_cents Int64
     """
 ).strip()
 
@@ -91,6 +120,16 @@ def parse_args() -> argparse.Namespace:
             "Can be repeated. Format: label=dsn  "
             "Example: --compare neon=postgresql://user:pass@host/db "
             "--compare supabase=postgresql://..."
+        ),
+    )
+    parser.add_argument(
+        "--compare-clickhouse",
+        action="append",
+        default=[],
+        metavar="LABEL=URL",
+        help=(
+            "Add a ClickHouse HTTP endpoint to compare against. "
+            "Can be repeated. Format: label=http://user:pass@host:8123/database"
         ),
     )
     parser.add_argument(
@@ -176,6 +215,27 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--compare label '{label}' conflicts with a Hydra layout name")
         compare_targets.append((label, dsn.strip()))
     args._compare_targets = compare_targets
+
+    clickhouse_targets: list[tuple[str, str]] = []
+    used_labels = set(hydra_layouts) | {label for label, _ in compare_targets}
+    for entry in args.compare_clickhouse:
+        if "=" not in entry:
+            parser.error(f"--compare-clickhouse must be label=url, got: {entry}")
+        label, url = entry.split("=", 1)
+        label = label.strip()
+        if not IDENTIFIER_RE.match(label):
+            parser.error(f"--compare-clickhouse label must be a simple identifier: {label}")
+        if label in used_labels:
+            parser.error(f"--compare-clickhouse label '{label}' conflicts with another target")
+        parsed_url = urlparse(url.strip())
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+            parser.error(
+                "--compare-clickhouse URL must look like "
+                "http://user:pass@host:8123/database"
+            )
+        clickhouse_targets.append((label, url.strip()))
+        used_labels.add(label)
+    args._clickhouse_targets = clickhouse_targets
 
     return args
 
@@ -292,6 +352,92 @@ def synthetic_select(start_id: int, end_id: int, work_rows: int) -> str:
     ).strip()
 
 
+def clickhouse_datetime_literal(value: datetime) -> str:
+    return "toDateTime(" + sql_literal(value.strftime("%Y-%m-%d %H:%M:%S")) + ")"
+
+
+def clickhouse_date_literal(value: datetime | Any) -> str:
+    if hasattr(value, "strftime"):
+        rendered = value.strftime("%Y-%m-%d")
+    else:
+        rendered = str(value)
+    return "toDate(" + sql_literal(rendered) + ")"
+
+
+def synthetic_select_clickhouse(start_id: int, end_id: int, work_rows: int) -> str:
+    row_count = end_id - start_id + 1
+    base_ts = clickhouse_datetime_literal(BASE_EVENT_TIME)
+    base_date = clickhouse_date_literal(BASE_EVENT_TIME.date())
+    return textwrap.dedent(
+        f"""
+        WITH number + {start_id} AS gs
+        SELECT
+            toInt64(gs) AS event_id,
+            toInt64(intDiv(gs - 1, {work_rows}) + 1) AS work_id,
+            toInt32(((gs - 1) % 64) + 1) AS tenant_id,
+            {base_ts} + toIntervalSecond(gs - 1) AS event_time,
+            {base_date} + toIntervalDay(intDiv(gs - 1, 86400)) AS event_date,
+            toInt64(1000000000 + (gs % 250000)) AS user_id,
+            toInt64(500000000 + (gs % 50000)) AS session_id,
+            toInt32(((gs - 1) % 128) + 1) AS region_id,
+            CASE gs % 6
+                WHEN 0 THEN 'api'
+                WHEN 1 THEN 'ingest'
+                WHEN 2 THEN 'worker'
+                WHEN 3 THEN 'search'
+                WHEN 4 THEN 'ui'
+                ELSE 'cron'
+            END AS service,
+            CASE gs % 7
+                WHEN 0 THEN 'state'
+                WHEN 1 THEN 'event'
+                WHEN 2 THEN 'metric'
+                WHEN 3 THEN 'audit'
+                WHEN 4 THEN 'search'
+                WHEN 5 THEN 'alert'
+                ELSE 'trace'
+            END AS kind,
+            toInt32(CASE gs % 9
+                WHEN 0 THEN 200
+                WHEN 1 THEN 201
+                WHEN 2 THEN 202
+                WHEN 3 THEN 204
+                WHEN 4 THEN 400
+                WHEN 5 THEN 404
+                WHEN 6 THEN 409
+                WHEN 7 THEN 429
+                ELSE 500
+            END) AS status,
+            toInt32(gs % 5) AS severity,
+            CASE gs % 4
+                WHEN 0 THEN 'desktop'
+                WHEN 1 THEN 'mobile'
+                WHEN 2 THEN 'worker'
+                ELSE 'server'
+            END AS device_type,
+            concat(
+                'https://app.example.com/',
+                if(gs % 10 = 0, 'api', 'resource'),
+                '/',
+                toString(gs % 20000)
+            ) AS url,
+            concat('title_', toString(gs % 20000), '_', toString(gs % 97)) AS title,
+            multiIf(
+                gs % 9 = 0, concat('google_', toString(gs % 5000)),
+                gs % 11 = 0, concat('error_', toString(gs % 2000)),
+                ''
+            ) AS search_phrase,
+            repeat(substring('abcdefghijklmnopqrstuvwxyz', (gs % 26) + 1, 1), 32 + (gs % 64)) AS payload,
+            toInt32(32 + (gs % 64)) AS payload_bytes,
+            toInt32(((gs * 13) % 3000) + 1) AS duration_ms,
+            toUInt8(gs % 13 = 0) AS is_error,
+            toUInt8(gs % 17 = 0) AS is_refresh,
+            toInt64((gs * 29) % 100000) AS revenue_cents
+        FROM numbers({row_count})
+        """
+    ).strip()
+
+
 def run_psql(dsn: str, sql: str, verbose: bool = False) -> str:
     if verbose:
         print(f"[sql] {sql.splitlines()[0][:100]}", file=sys.stderr)
@@ -309,6 +455,50 @@ def run_psql(dsn: str, sql: str, verbose: bool = False) -> str:
             f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
     return result.stdout.strip()
+
+
+def clickhouse_http_url(dsn: str) -> str:
+    parsed = urlparse(dsn)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"ClickHouse URL must use http or https: {dsn}")
+    if not parsed.hostname:
+        raise ValueError(f"ClickHouse URL must include a host: {dsn}")
+
+    netloc = parsed.hostname
+    if parsed.port is not None:
+        netloc += f":{parsed.port}"
+
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    database = parsed.path.strip("/") or params.get("database") or "default"
+    params["database"] = database
+    if parsed.username and "user" not in params:
+        params["user"] = parsed.username
+    if parsed.password is not None and "password" not in params:
+        params["password"] = parsed.password
+
+    return urlunparse((parsed.scheme, netloc, "/", "", urlencode(params), ""))
+
+
+def run_clickhouse(dsn: str, sql: str, verbose: bool = False) -> str:
+    if verbose:
+        print(f"[clickhouse] {sql.splitlines()[0][:100]}", file=sys.stderr)
+
+    request = Request(
+        clickhouse_http_url(dsn),
+        data=sql.encode("utf-8"),
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=None) as response:
+            return response.read().decode("utf-8").strip()
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"ClickHouse HTTP failed with status {exc.code}\n"
+            f"STDERR:\n{body}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(f"ClickHouse HTTP failed: {exc}") from exc
 
 
 def exec_sql(dsn: str, sql: str, verbose: bool = False) -> None:
@@ -344,6 +534,20 @@ def explain_timing_ms(dsn: str, query: str) -> float:
     return float(plan[0]["Execution Time"])
 
 
+def clickhouse_query_timing_ms(dsn: str, query: str) -> float:
+    sql = query.rstrip().rstrip(";") + "\nFORMAT Null"
+    start = time.perf_counter()
+    run_clickhouse(dsn, sql)
+    return (time.perf_counter() - start) * 1000
+
+
+def adapt_query_for_clickhouse(query: str) -> str:
+    return query.replace(
+        "COUNT(*) FILTER (WHERE is_error) AS errors",
+        "countIf(is_error) AS errors",
+    )
+
+
 def parse_queries(path: Path) -> list[tuple[str, str]]:
     queries: list[tuple[str, str]] = []
     current_name: str | None = None
@@ -376,6 +580,34 @@ def create_layout_schema(
 ) -> LayoutContext:
     schema = layout_schema(label)
     columns = table_columns_clause()
+
+    if layout == "clickhouse":
+        ch_columns = ",\n    ".join(
+            line.strip().rstrip(",") for line in CLICKHOUSE_TABLE_COLUMNS.splitlines()
+        )
+        run_clickhouse(dsn, f"DROP DATABASE IF EXISTS {schema}", verbose=verbose)
+        run_clickhouse(dsn, f"CREATE DATABASE {schema}", verbose=verbose)
+        run_clickhouse(
+            dsn,
+            textwrap.dedent(
+                f"""
+                CREATE TABLE {schema}.events (
+                    {ch_columns}
+                )
+                ENGINE = MergeTree
+                ORDER BY event_id;
+                """
+            ),
+            verbose=verbose,
+        )
+        return LayoutContext(
+            name=label,
+            layout=layout,
+            schema=schema,
+            logical_table=f"{schema}.events",
+            write_table=f"{schema}.events",
+            size_tables=["events"],
+        )
 
     if layout == "external_postgres":
         exec_sql(
@@ -428,12 +660,24 @@ def create_layout_schema(
 
 def load_rows(
     dsn: str,
+    layout: str,
     table_name: str,
     start_id: int,
     end_id: int,
     work_rows: int,
     verbose: bool = False,
 ) -> float:
+    if layout == "clickhouse":
+        sql = textwrap.dedent(
+            f"""
+            INSERT INTO {table_name}
+            {synthetic_select_clickhouse(start_id, end_id, work_rows)}
+            """
+        )
+        start = time.perf_counter()
+        run_clickhouse(dsn, sql, verbose=verbose)
+        return time.perf_counter() - start
+
     sql = textwrap.dedent(
         f"""
         INSERT INTO {table_name}
@@ -447,6 +691,9 @@ def load_rows(
 
 
 def analyze_layout(dsn: str, ctx: LayoutContext, rows: int = 0, verbose: bool = False) -> float:
+    if ctx.layout == "clickhouse":
+        return 0.0
+
     # Set n_distinct hints for columns with known cardinalities.
     # Columnar's ANALYZE produces degenerate n_distinct on PG17+ due to
     # block-based sampling not scaling totalrows correctly.
@@ -476,6 +723,19 @@ def analyze_layout(dsn: str, ctx: LayoutContext, rows: int = 0, verbose: bool = 
 
 
 def relation_sizes(dsn: str, ctx: LayoutContext) -> dict[str, int]:
+    if ctx.layout == "clickhouse":
+        sql = textwrap.dedent(
+            f"""
+            SELECT ifNull(sum(bytes_on_disk), 0)
+            FROM system.parts
+            WHERE database = {sql_literal(ctx.schema)}
+              AND table = 'events'
+              AND active
+            """
+        )
+        output = run_clickhouse(dsn, sql)
+        return {"events": int(output or "0")}
+
     parts = ",".join(sql_literal(name) for name in ctx.size_tables)
     sql = textwrap.dedent(
         f"""
@@ -501,12 +761,19 @@ def build_query_context(rows: int, work_rows: int, ctx: LayoutContext) -> dict[s
     recent_end = BASE_EVENT_TIME + timedelta(seconds=rows)
     recent_start = max(BASE_EVENT_TIME, recent_end - timedelta(hours=6))
 
+    if ctx.layout == "clickhouse":
+        recent_start_sql = clickhouse_datetime_literal(recent_start)
+        recent_end_sql = clickhouse_datetime_literal(recent_end)
+    else:
+        recent_start_sql = sql_literal(recent_start.isoformat())
+        recent_end_sql = sql_literal(recent_end.isoformat())
+
     return {
         "logical_table": ctx.logical_table,
         "hot_work_lower": str(hot_work_lower),
         "hot_work_upper": str(hot_work_upper),
-        "recent_window_start": sql_literal(recent_start.isoformat()),
-        "recent_window_end": sql_literal(recent_end.isoformat()),
+        "recent_window_start": recent_start_sql,
+        "recent_window_end": recent_end_sql,
     }
 
 
@@ -522,7 +789,11 @@ def run_query_suite(
 
     for name, template in parse_queries(QUERY_FILE):
         query = template.format_map(context)
-        timings = [explain_timing_ms(dsn, query) for _ in range(query_runs)]
+        if ctx.layout == "clickhouse":
+            query = adapt_query_for_clickhouse(query)
+            timings = [clickhouse_query_timing_ms(dsn, query) for _ in range(query_runs)]
+        else:
+            timings = [explain_timing_ms(dsn, query) for _ in range(query_runs)]
         results[name] = {
             "query": query,
             "runs_ms": [round(value, 3) for value in timings],
@@ -549,7 +820,10 @@ def append_batches(
     for _ in range(batch_count):
         next_end = next_start + batch_rows - 1
         timings.append(
-            load_rows(dsn, ctx.write_table, next_start, next_end, work_rows, verbose=verbose)
+            load_rows(
+                dsn, ctx.layout, ctx.write_table,
+                next_start, next_end, work_rows, verbose=verbose
+            )
         )
         next_start = next_end + 1
 
@@ -575,6 +849,38 @@ def update_hot_slice(
     total_work_ids = math.ceil(rows / work_rows)
     hot_work_upper = total_work_ids
     hot_work_lower = max(1, hot_work_upper - 24)
+
+    if ctx.layout == "clickhouse":
+        count_sql = textwrap.dedent(
+            f"""
+            SELECT count()
+            FROM {ctx.write_table}
+            WHERE work_id BETWEEN {hot_work_lower} AND {hot_work_upper}
+            """
+        )
+        updated = int(run_clickhouse(dsn, count_sql) or "0")
+        update_sql = textwrap.dedent(
+            f"""
+            ALTER TABLE {ctx.write_table}
+            UPDATE
+                severity = (severity + 1) % 5,
+                status = if(status = 200, 202, status),
+                is_refresh = 1 - is_refresh
+            WHERE work_id BETWEEN {hot_work_lower} AND {hot_work_upper}
+            SETTINGS mutations_sync = 1
+            """
+        )
+
+        start = time.perf_counter()
+        run_clickhouse(dsn, update_sql, verbose=verbose)
+        seconds = time.perf_counter() - start
+
+        return {
+            "seconds": round(seconds, 4),
+            "rows_updated": updated,
+            "work_id_lower": hot_work_lower,
+            "work_id_upper": hot_work_upper,
+        }
 
     sql = textwrap.dedent(
         f"""
@@ -604,6 +910,13 @@ def update_hot_slice(
 
 def cleanup_targets(targets: list[BenchmarkTarget], verbose: bool = False) -> None:
     for target in targets:
+        if target.layout == "clickhouse":
+            run_clickhouse(
+                target.dsn,
+                f"DROP DATABASE IF EXISTS {layout_schema(target.label)}",
+                verbose=verbose,
+            )
+            continue
         exec_sql(
             target.dsn,
             f"DROP SCHEMA IF EXISTS {layout_schema(target.label)} CASCADE;",
@@ -712,6 +1025,10 @@ def main() -> int:
         targets.append(
             BenchmarkTarget(label=label, layout="external_postgres", dsn=compare_dsn)
         )
+    for label, clickhouse_url in args._clickhouse_targets:
+        targets.append(
+            BenchmarkTarget(label=label, layout="clickhouse", dsn=clickhouse_url)
+        )
 
     report: dict[str, Any] = {
         "config": {
@@ -721,6 +1038,7 @@ def main() -> int:
             "layouts": [t.label for t in targets],
             "hydra_layouts": hydra_layouts,
             "compare_targets": [label for label, _ in args._compare_targets],
+            "clickhouse_targets": [label for label, _ in args._clickhouse_targets],
             "query_runs": args.query_runs,
             "append_batches": args.append_batches,
             "append_rows": args.append_rows,
@@ -744,6 +1062,7 @@ def main() -> int:
 
             load_seconds = load_rows(
                 target.dsn,
+                target.layout,
                 ctx.write_table,
                 1,
                 args.rows,
@@ -775,9 +1094,15 @@ def main() -> int:
                     "error": str(e)[:200],
                 }
             try:
-                logical_rows = query_scalar_int(
-                    target.dsn, f"SELECT COUNT(*) FROM {ctx.logical_table};",
-                )
+                if target.layout == "clickhouse":
+                    logical_rows = int(
+                        run_clickhouse(target.dsn, f"SELECT count() FROM {ctx.logical_table}")
+                        or "0"
+                    )
+                else:
+                    logical_rows = query_scalar_int(
+                        target.dsn, f"SELECT COUNT(*) FROM {ctx.logical_table};",
+                    )
             except RuntimeError:
                 logical_rows = -1
 

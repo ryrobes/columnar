@@ -56,6 +56,54 @@ python3 bench/local_storage_benchmark.py \
   --output tmp/storage-bench.json
 ```
 
+## ClickHouse Comparison
+
+The storage benchmark can also target ClickHouse over its HTTP API. The
+ClickHouse target uses the same synthetic rows and query templates, but
+creates a native `MergeTree` table and uses ClickHouse-specific load,
+size, timing, and mutation paths.
+
+Start a local ClickHouse benchmark container:
+
+```bash
+make clickhouse_bench_start
+```
+
+Run a smoke comparison:
+
+```bash
+make bench_storage_clickhouse_smoke
+```
+
+Run the 25M-row columnar-vs-ClickHouse comparison:
+
+```bash
+make bench_storage_clickhouse_25m
+```
+
+Direct invocation:
+
+```bash
+python3 bench/local_storage_benchmark.py \
+  --dsn postgresql://postgres:postgres@127.0.0.1:5432/postgres \
+  --layouts columnar \
+  --rows 25000000 \
+  --query-runs 3 \
+  --append-batches 5 \
+  --append-rows 10000 \
+  --compare-clickhouse clickhouse=http://default:clickhouse@127.0.0.1:8123/default \
+  --output tmp/clickhouse-25m.json
+```
+
+Notes:
+
+* Query timings for ClickHouse are wall-clock HTTP timings using
+  `FORMAT Null`; PostgreSQL timings come from `EXPLAIN ANALYZE`.
+* ClickHouse `UPDATE` is measured as a synchronous mutation with
+  `mutations_sync = 1`, so it is not the same execution model as
+  PostgreSQL MVCC updates.
+* The default benchmark table is `MergeTree ORDER BY event_id`.
+
 ## Layouts
 
 On the Hydra instance (default `--layouts heap,columnar`):
