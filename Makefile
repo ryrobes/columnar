@@ -140,6 +140,32 @@ bench_storage:
 bench_storage_smoke:
 	python3 bench/local_storage_benchmark.py --dsn "$(BENCH_DSN)" --rows 50000 --query-runs 1 --append-batches 3 --append-rows 1000 $(BENCH_ARGS)
 
+VECTOR_BENCH_ARGS ?=
+PG_MAJOR ?= 18
+PGVECTOR_REF ?= v0.8.2
+PGVECTORSCALE_REPO ?= https://github.com/ryrobes/pgvectorscale.git
+PGVECTORSCALE_REF ?= main
+
+.PHONY: bench_vector
+bench_vector:
+	python3 bench/vector_benchmark.py $(VECTOR_BENCH_ARGS)
+
+.PHONY: image_pgvector_baseline
+image_pgvector_baseline:
+	docker build -f bench/Dockerfile.pgvector \
+		--build-arg PG_MAJOR=$(PG_MAJOR) \
+		--build-arg PGVECTOR_REF=$(PGVECTOR_REF) \
+		-t postgres$(PG_MAJOR)-pgvector:$(PGVECTOR_REF) .
+
+.PHONY: image_pgvectorscale_baseline
+image_pgvectorscale_baseline:
+	docker build -f bench/Dockerfile.pgvectorscale \
+		--build-arg PG_MAJOR=$(PG_MAJOR) \
+		--build-arg PGVECTOR_REF=$(PGVECTOR_REF) \
+		--build-arg PGVECTORSCALE_REPO=$(PGVECTORSCALE_REPO) \
+		--build-arg PGVECTORSCALE_REF=$(PGVECTORSCALE_REF) \
+		-t postgres$(PG_MAJOR)-pgvectorscale:$(PGVECTORSCALE_REF) .
+
 ##
 ## Distribution image — a self-contained PG18 + columnar + pgvector image
 ## that can be pushed to a registry and run without this repo.

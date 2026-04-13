@@ -1,0 +1,22 @@
+ARG PG_MAJOR=18
+FROM postgres:${PG_MAJOR}-bookworm AS builder
+
+ARG PG_MAJOR=18
+ARG PGVECTOR_REF=v0.8.2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git gcc make postgresql-server-dev-${PG_MAJOR} \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp
+RUN git clone --depth 1 --branch ${PGVECTOR_REF} https://github.com/pgvector/pgvector.git && \
+    cd pgvector && \
+    make && make install
+
+FROM postgres:${PG_MAJOR}-bookworm
+
+ARG PG_MAJOR=18
+
+COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/vector* /usr/share/postgresql/${PG_MAJOR}/extension/
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/vector.so /usr/lib/postgresql/${PG_MAJOR}/lib/vector.so
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/bitcode/vector* /usr/lib/postgresql/${PG_MAJOR}/lib/bitcode/

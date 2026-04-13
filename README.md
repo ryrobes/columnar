@@ -137,6 +137,11 @@ The `bench/` harness was simplified and updated:
   produces `n_distinct = -Infinity` for the columnar scan's sample,
   which would otherwise make the planner pick Sort+GroupAggregate
   instead of HashAggregate on GROUP BY queries
+- Added `bench/vector_benchmark.py` for pgvector/pgvectorscale workloads.
+  It compares exact search, pgvector HNSW, and pgvectorscale DiskANN
+  when available, reports recall against exact top-k, and forces vector
+  tables to `USING heap` so ANN indexes are tested on a reliable storage
+  path.
 
 For reader/storage experiments, `columnar.enable_scan_diagnostics` can be
 enabled for `EXPLAIN ANALYZE`. It is off by default and reports per-scan
@@ -313,9 +318,33 @@ holds at larger scale.
 Columnar wins every single analytic query, typically **3-40x faster**
 than heap / vanilla PG / AlloyDB while using a fraction of the disk.
 
+### Vector / ANN Experiment
+
+The vector benchmark uses heap-backed vector tables on every target,
+including the PG18 columnar image. This is intentional: ANN index access
+methods should not be treated as reliable on columnar tables yet.
+
+50k rows, 64 dimensions, 6 query vectors, 3 timing runs:
+
+| target          | extension(s)                 | HNSW unfiltered | HNSW category | HNSW tenant | recall |
+|-----------------|------------------------------|----------------:|--------------:|------------:|-------:|
+| columnar_pg18   | vector 0.8.2                 | 0.357 ms        | 0.652 ms      | 1.874 ms    | 1.000  |
+| pg18_vector     | vector 0.8.2                 | 0.620 ms        | 0.900 ms      | 2.262 ms    | 1.000  |
+| pg15_vector     | vector 0.8.2                 | 0.451 ms        | 0.720 ms      | 1.891 ms    | 1.000  |
+| alloydb         | vector 0.8.1.google-1        | 0.444 ms        | 0.720 ms      | 1.737 ms    | 1.000  |
+
+An optional PG18 pgvectorscale image builds and runs DiskANN. On this
+synthetic filtered workload, plain DiskANN was fast but needed tuning to
+reach acceptable filtered recall, while label-aware DiskANN was rejected
+for now because it produced poor recall on selective label filters even
+with higher candidate/rescore settings.
+
 ### Takeaways
 
 - **OLAP**: columnar is dramatically faster *and* uses ~16x less disk.
+- **Vector search**: keep embedding tables heap-backed today; use the
+  new vector benchmark to validate HNSW/DiskANN latency *and* recall
+  before moving a workload to an ANN index.
 - **Bulk hot-slice UPDATEs**: the cached row-version path makes columnar
   faster than heap and vanilla PG on this benchmark's update workload.
 - **OLTP point updates**: heap can still be the right choice for very

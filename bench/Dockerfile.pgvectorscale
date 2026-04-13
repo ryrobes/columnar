@@ -1,0 +1,42 @@
+ARG PG_MAJOR=18
+FROM postgres:${PG_MAJOR}-bookworm AS builder
+
+ARG PG_MAJOR=18
+ARG PGVECTOR_REF=v0.8.2
+ARG PGVECTORSCALE_REPO=https://github.com/ryrobes/pgvectorscale.git
+ARG PGVECTORSCALE_REF=main
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git gcc make clang libclang-dev pkg-config libssl-dev \
+    postgresql-server-dev-${PG_MAJOR} \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp
+
+RUN git clone --depth 1 --branch ${PGVECTOR_REF} https://github.com/pgvector/pgvector.git && \
+    cd pgvector && \
+    make && make install
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal
+
+RUN cargo install --locked cargo-pgrx --version 0.16.1
+
+RUN cargo pgrx init --pg${PG_MAJOR} /usr/bin/pg_config
+
+RUN git clone --depth 1 --branch ${PGVECTORSCALE_REF} ${PGVECTORSCALE_REPO} pgvectorscale && \
+    cd pgvectorscale/pgvectorscale && \
+    cargo pgrx install --release --no-default-features --features pg${PG_MAJOR},build_parallel
+
+FROM postgres:${PG_MAJOR}-bookworm
+
+ARG PG_MAJOR=18
+
+COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/vector* /usr/share/postgresql/${PG_MAJOR}/extension/
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/vector.so /usr/lib/postgresql/${PG_MAJOR}/lib/vector.so
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/bitcode/vector* /usr/lib/postgresql/${PG_MAJOR}/lib/bitcode/
+
+COPY --from=builder /usr/share/postgresql/${PG_MAJOR}/extension/vectorscale* /usr/share/postgresql/${PG_MAJOR}/extension/
+COPY --from=builder /usr/lib/postgresql/${PG_MAJOR}/lib/vectorscale*.so /usr/lib/postgresql/${PG_MAJOR}/lib/
