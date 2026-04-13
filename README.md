@@ -267,15 +267,17 @@ The resulting image is ~500 MB, self-contained, and includes:
 ## 💪 Benchmark Results
 
 **25 million rows, 5 query runs each**, against vanilla PG15, vanilla
-PG18, and AlloyDB. Medians in milliseconds, smaller is better. The
-`heap` and `columnar` columns are this fork running on PG18.
+PG18, and AlloyDB Omni with the columnar engine enabled and populated.
+Medians in milliseconds, smaller is better. The `heap` and `columnar`
+columns are this fork running on PG18.
 
 Reproduce:
 ```bash
+make alloydb_columnar_bench_start
 make bench_storage BENCH_ARGS="--rows 25000000 --query-runs 5 \
   --compare vanilla_pg15=postgresql://postgres:postgres@localhost:5415/postgres \
   --compare vanilla_pg18=postgresql://postgres:postgres@localhost:5418/postgres \
-  --compare alloydb=postgresql://postgres:postgres@localhost:5434/postgres \
+  --compare-alloydb-columnar alloydb=postgresql://postgres:notofox@localhost:5444/postgres \
   --output tmp/comparison4.json"
 ```
 
@@ -283,17 +285,20 @@ make bench_storage BENCH_ARGS="--rows 25000000 --query-runs 5 \
 
 | metric               | heap     | columnar  | vanilla_pg15 | vanilla_pg18 | alloydb   |
 |----------------------|---------:|----------:|-------------:|-------------:|----------:|
-| total_size_mb        | 6303.508 | **381.531** | 6303.508     | 6303.508     | 6330.477  |
-| load_seconds         | 49.297   | 62.926    | 60.825       | 66.274       | 63.985    |
-| append_total_seconds | 0.222    | 0.285     | 0.237        | 0.887        | 0.504     |
-| update_seconds       | 0.900    | **0.248** | 1.397        | 0.924        | 2.186     |
+| total_size_mb        | 6303.508 | **381.531** | 6303.508     | 6303.508     | 8176.184  |
+| load_seconds         | **53.357** | 64.669   | 61.843       | 68.019       | 62.147    |
+| append_total_seconds | 0.223    | 0.294     | **0.214**    | 0.227        | 0.592     |
+| update_seconds       | 0.969    | **0.249** | 1.461        | 0.898        | 1.610     |
 
 Columnar hits **381 MB** vs ~6300 MB for row storage — a **~16.5x
-compression ratio**.
+compression ratio**. The AlloyDB number includes the heap table plus
+its populated columnar store, so its total reported footprint is much
+larger on this workload.
 
-The UPDATE path is now faster than the row-store comparison targets on
-this benchmark's hot-slice update: **0.248s** for columnar vs **0.900s**
-for this fork's heap layout and **0.924s** for vanilla PG18. The speedup
+The UPDATE path is now faster than the comparison targets on
+this benchmark's hot-slice update: **0.249s** for columnar vs **0.969s**
+for this fork's heap layout, **0.898s** for vanilla PG18, and **1.610s**
+for AlloyDB Omni columnar. The speedup
 comes from keeping the PG18-correct old-row materialization path while
 removing the avoidable per-row setup:
 
@@ -318,21 +323,24 @@ holds at larger scale.
 
 | query               | heap     | columnar    | vanilla_pg15 | vanilla_pg18 | alloydb    |
 |---------------------|---------:|------------:|-------------:|-------------:|-----------:|
-| count_all           | 872.410  | **41.821**  | 842.846      | 668.173      | 1204.778   |
-| distinct_users      | 1160.017 | **850.007** | 2801.828     | 1096.335     | 1536.177   |
-| filtered_count      | 862.658  | **115.859** | 1057.100     | 806.889      | 1354.271   |
-| hot_work_slice      | 490.507  | **12.057**  | 586.343      | 397.260      | 910.522    |
-| latency_rollup      | 933.343  | **182.509** | 1069.464     | 842.217      | 1411.207   |
-| recent_window       | 483.517  | **11.829**  | 611.072      | 432.822      | 1101.584   |
-| region_day_rollup   | 1689.014 | **501.875** | 1824.279     | 1639.293     | 2061.662   |
-| search_phrase_topn  | 969.352  | **227.706** | 1154.421     | 908.530      | 1712.020   |
-| service_topn        | 1337.433 | **430.010** | 1569.955     | 1335.628     | 1635.201   |
-| tenant_error_rollup | 1707.181 | **535.808** | 1937.736     | 1668.978     | 2076.820   |
-| url_like            | 1489.978 | **295.046** | 1564.546     | 1399.642     | 1763.450   |
-| wide_sum            | 1715.764 | **530.874** | 1947.960     | 1682.641     | 2137.293   |
+| count_all           | 2547.410 | 45.183      | 1001.063     | 816.118      | **6.598**  |
+| distinct_users      | 1136.763 | **833.566** | 3056.465     | 1410.120     | 887.830    |
+| filtered_count      | 1018.525 | 113.629     | 1064.138     | 998.725      | **14.138** |
+| hot_work_slice      | 599.912  | 9.417       | 741.075      | 488.803      | **6.602**  |
+| latency_rollup      | 946.318  | 182.115     | 1145.953     | 1279.122     | **38.358** |
+| recent_window       | 609.940  | 12.710      | 672.002      | 486.326      | **9.464**  |
+| region_day_rollup   | 1714.021 | 594.021     | 1963.417     | 1942.693     | **174.669** |
+| search_phrase_topn  | 945.260  | 273.618     | 1226.307     | 1286.642     | **121.332** |
+| service_topn        | 1440.014 | 570.569     | 1600.539     | 1510.972     | **84.961** |
+| tenant_error_rollup | 1743.451 | **519.468** | 2077.959     | 1793.226     | 1582.923   |
+| url_like            | 1556.263 | 345.130     | 1702.384     | 1608.758     | **86.171** |
+| wide_sum            | 1936.116 | 523.074     | 2260.169     | 1834.078     | **518.518** |
 
-Columnar wins every single analytic query, typically **3-40x faster**
-than heap / vanilla PG / AlloyDB while using a fraction of the disk.
+With the AlloyDB columnar engine actually enabled, AlloyDB is a much
+stronger read baseline and wins 10 of the 12 analytical queries in this
+run. This fork still has the smallest storage footprint by a wide
+margin, the fastest UPDATE path, and wins `distinct_users` and
+`tenant_error_rollup`.
 
 ### ClickHouse Comparison
 
