@@ -2,7 +2,7 @@
 
 # 🐘🤘 Hydra Columnar (PG18 Fork)
 
-This is a fork of the (apparently abandoned) [Hydra Columnar](https://github.com/hydradatabase/hydra)
+This is a fork of the (apparently abandoned?) [Hydra Columnar](https://github.com/hydradatabase/hydra)
 PostgreSQL 14 extension. The upstream last saw meaningful activity in
 early 2024; this fork picks it up and moves it forward.
 
