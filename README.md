@@ -142,6 +142,10 @@ The `bench/` harness was simplified and updated:
   when available, reports recall against exact top-k, and forces vector
   tables to `USING heap` so ANN indexes are tested on a reliable storage
   path.
+- Added Docker targets for vector baselines:
+  `image_pgvector_baseline` builds vanilla PG15/PG18 + pgvector, and
+  `image_pgvectorscale_baseline` builds an optional PG18 +
+  pgvectorscale image for DiskANN experiments.
 
 For reader/storage experiments, `columnar.enable_scan_diagnostics` can be
 enabled for `EXPLAIN ANALYZE`. It is off by default and reports per-scan
@@ -317,6 +321,53 @@ holds at larger scale.
 
 Columnar wins every single analytic query, typically **3-40x faster**
 than heap / vanilla PG / AlloyDB while using a fraction of the disk.
+
+### Upstream Hydra PG14 Comparison
+
+Measured against `ghcr.io/hydradatabase/hydra:latest` on port `5499`.
+That container reports PostgreSQL 14.13, upstream `columnar 11.1-12`,
+and `default_table_access_method = columnar`; the benchmark's
+`--compare` table creation therefore measures upstream Hydra columnar.
+
+Reproduce:
+```bash
+python3 bench/local_storage_benchmark.py \
+  --dsn postgresql://postgres:postgres@127.0.0.1:5432/postgres \
+  --rows 5000000 --query-runs 3 --append-batches 5 --append-rows 10000 \
+  --compare hydra_pg14_upstream=postgresql://postgres:postgres@127.0.0.1:5499/postgres \
+  --cleanup --output tmp/hydra-pg14-5m.json
+```
+
+5 million rows, 3 query runs each:
+
+| metric               | heap      | columnar | hydra_pg14_upstream |
+|----------------------|----------:|---------:|--------------------:|
+| total_size_mb        | 1260.734  | 76.328   | 76.328              |
+| load_seconds         | 8.787     | 13.061   | 13.222              |
+| append_total_seconds | 0.159     | 0.223    | 0.240               |
+| update_seconds       | 0.261     | 0.184    | 0.121               |
+
+| query               | heap    | columnar | hydra_pg14_upstream |
+|---------------------|--------:|---------:|--------------------:|
+| count_all           | 140.797 | 16.874   | 11.935              |
+| distinct_users      | 443.647 | 149.021  | 144.727             |
+| filtered_count      | 178.087 | 28.747   | 29.368              |
+| hot_work_slice      | 86.550  | 6.729    | 6.724               |
+| latency_rollup      | 187.201 | 39.684   | 43.380              |
+| recent_window       | 101.900 | 8.893    | 9.805               |
+| region_day_rollup   | 374.589 | 114.526  | 119.246             |
+| search_phrase_topn  | 206.639 | 72.605   | 60.192              |
+| service_topn        | 274.316 | 99.868   | 100.648             |
+| tenant_error_rollup | 352.520 | 124.065  | 122.428             |
+| url_like            | 296.673 | 71.376   | 76.692              |
+| wide_sum            | 342.540 | 121.208  | 122.741             |
+
+Read performance is still within a few percent of upstream Hydra PG14 on
+most queries. The point of this fork is not a wholesale replacement of
+upstream's read algorithm; the win is keeping comparable read/storage
+behavior while adding PG18 support, safer DML, correct row counts and
+VACUUM behavior, scan diagnostics, pgvector packaging, and reproducible
+baseline benchmarks.
 
 ### Vector / ANN Experiment
 
