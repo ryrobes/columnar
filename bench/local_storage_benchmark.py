@@ -81,6 +81,31 @@ CLICKHOUSE_TABLE_COLUMNS = textwrap.dedent(
     """
 ).strip()
 
+ALLOYDB_COLUMNAR_COLUMNS = ",".join(
+    [
+        "event_id",
+        "work_id",
+        "tenant_id",
+        "event_time",
+        "event_date",
+        "user_id",
+        "session_id",
+        "region_id",
+        "service",
+        "kind",
+        "status",
+        "severity",
+        "device_type",
+        "url",
+        "search_phrase",
+        "payload_bytes",
+        "duration_ms",
+        "is_error",
+        "is_refresh",
+        "revenue_cents",
+    ]
+)
+
 
 @dataclass
 class BenchmarkTarget:
@@ -131,6 +156,31 @@ def parse_args() -> argparse.Namespace:
             "Add a ClickHouse HTTP endpoint to compare against. "
             "Can be repeated. Format: label=http://user:pass@host:8123/database"
         ),
+    )
+    parser.add_argument(
+        "--compare-alloydb-columnar",
+        action="append",
+        default=[],
+        metavar="LABEL=DSN",
+        help=(
+            "Add an AlloyDB Omni instance with google_columnar_engine.enabled=on. "
+            "The harness creates a row table, populates the AlloyDB column store, "
+            "and verifies query plans use the columnar scan. Can be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--alloydb-columnar-columns",
+        default=ALLOYDB_COLUMNAR_COLUMNS,
+        help=(
+            "Comma-separated columns to populate through google_columnar_engine_add "
+            "for --compare-alloydb-columnar targets. Default: benchmark query columns."
+        ),
+    )
+    parser.add_argument(
+        "--alloydb-columnar-wait-ms",
+        type=int,
+        default=600_000,
+        help="Timeout for AlloyDB columnar population jobs. Default: %(default)s",
     )
     parser.add_argument(
         "--rows",
@@ -194,6 +244,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--append-batches must be non-negative")
     if args.append_rows <= 0:
         parser.error("--append-rows must be positive")
+    if args.alloydb_columnar_wait_ms <= 0:
+        parser.error("--alloydb-columnar-wait-ms must be positive")
 
     hydra_layouts = [item.strip() for item in args.layouts.split(",") if item.strip()]
     unknown = sorted(set(hydra_layouts) - HYDRA_LAYOUTS)
@@ -236,6 +288,24 @@ def parse_args() -> argparse.Namespace:
         clickhouse_targets.append((label, url.strip()))
         used_labels.add(label)
     args._clickhouse_targets = clickhouse_targets
+
+    alloydb_columnar_targets: list[tuple[str, str]] = []
+    for entry in args.compare_alloydb_columnar:
+        if "=" not in entry:
+            parser.error(f"--compare-alloydb-columnar must be label=dsn, got: {entry}")
+        label, dsn = entry.split("=", 1)
+        label = label.strip()
+        if not IDENTIFIER_RE.match(label):
+            parser.error(
+                f"--compare-alloydb-columnar label must be a simple identifier: {label}"
+            )
+        if label in used_labels:
+            parser.error(
+                f"--compare-alloydb-columnar label '{label}' conflicts with another target"
+            )
+        alloydb_columnar_targets.append((label, dsn.strip()))
+        used_labels.add(label)
+    args._alloydb_columnar_targets = alloydb_columnar_targets
 
     return args
 
@@ -521,17 +591,40 @@ def query_scalar_json(dsn: str, sql: str) -> Any:
     return json.loads(output)
 
 
-def explain_timing_ms(dsn: str, query: str) -> float:
+def explain_plan_json(dsn: str, query: str, prelude: str = "") -> Any:
+    prelude_sql = prelude.strip()
+    if prelude_sql and not prelude_sql.endswith(";"):
+        prelude_sql += ";"
     sql = textwrap.dedent(
         f"""
         SET client_min_messages TO warning;
         SET jit = off;
+        {prelude_sql}
         EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
         {query}
         """
     )
-    plan = query_scalar_json(dsn, sql)
+    return query_scalar_json(dsn, sql)
+
+
+def explain_timing_ms(dsn: str, query: str) -> float:
+    plan = explain_plan_json(dsn, query)
     return float(plan[0]["Execution Time"])
+
+
+def plan_uses_alloydb_columnar(plan: Any) -> bool:
+    if isinstance(plan, dict):
+        provider = str(plan.get("Custom Plan Provider", "")).lower()
+        if provider == "columnar scan":
+            return True
+        if "Rows Aggregated by Columnar Scan" in plan:
+            return True
+        if "Rows Removed by Columnar Filter" in plan:
+            return True
+        return any(plan_uses_alloydb_columnar(value) for value in plan.values())
+    if isinstance(plan, list):
+        return any(plan_uses_alloydb_columnar(value) for value in plan)
+    return False
 
 
 def clickhouse_query_timing_ms(dsn: str, query: str) -> float:
@@ -609,7 +702,7 @@ def create_layout_schema(
             size_tables=["events"],
         )
 
-    if layout == "external_postgres":
+    if layout in {"external_postgres", "alloydb_columnar"}:
         exec_sql(
             dsn,
             textwrap.dedent(
@@ -722,6 +815,95 @@ def analyze_layout(dsn: str, ctx: LayoutContext, rows: int = 0, verbose: bool = 
     return time.perf_counter() - start
 
 
+def prepare_alloydb_columnar(
+    dsn: str,
+    ctx: LayoutContext,
+    columns: str,
+    wait_ms: int,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    enabled = run_psql(dsn, "SHOW google_columnar_engine.enabled;").strip().lower()
+    memory_size_mb = run_psql(
+        dsn, "SHOW google_columnar_engine.memory_size_in_mb;"
+    ).strip()
+    if enabled != "on":
+        raise RuntimeError(
+            "AlloyDB columnar target requires google_columnar_engine.enabled=on. "
+            "Start Omni with: postgres -c google_columnar_engine.enabled=on "
+            "-c google_columnar_engine.memory_size_in_mb=<MB>"
+        )
+
+    start = time.perf_counter()
+    output = run_psql(
+        dsn,
+        textwrap.dedent(
+            f"""
+            SET client_min_messages TO warning;
+            SELECT google_columnar_engine_add(
+                relation => {sql_literal(ctx.logical_table)}::regclass,
+                columns => {sql_literal(columns)},
+                no_wait => false,
+                force_foreground => true
+            );
+            SELECT google_columnar_engine_jobs_wait({wait_ms});
+            """
+        ),
+        verbose=verbose,
+    )
+    populate_seconds = time.perf_counter() - start
+
+    output_lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not output_lines or output_lines[-1].lower() not in {"t", "true"}:
+        raise RuntimeError(
+            "AlloyDB columnar population did not finish before "
+            f"--alloydb-columnar-wait-ms={wait_ms}"
+        )
+
+    stats = query_scalar_json(
+        dsn,
+        textwrap.dedent(
+            f"""
+            SELECT COALESCE((
+                SELECT row_to_json(s)
+                FROM (
+                    SELECT
+                        status,
+                        size,
+                        invalid_block_count,
+                        block_count_in_cc,
+                        total_block_count,
+                        auto_refresh_trigger_count,
+                        auto_refresh_failure_count,
+                        auto_refresh_recent_status
+                    FROM g_columnar_relations
+                    WHERE schema_name = {sql_literal(ctx.schema)}
+                      AND relation_name = 'events'
+                    LIMIT 1
+                ) s
+            ), '{{}}'::json);
+            """
+        ),
+    )
+    if not stats:
+        raise RuntimeError(
+            f"AlloyDB did not report {ctx.logical_table} in g_columnar_relations"
+        )
+    if str(stats.get("status", "")).lower() != "usable":
+        raise RuntimeError(
+            f"AlloyDB columnar relation is not usable: {stats.get('status')}"
+        )
+
+    return {
+        "enabled": enabled,
+        "memory_size_mb": int(memory_size_mb),
+        "columns": columns,
+        "populate_seconds": round(populate_seconds, 4),
+        "add_result": output_lines[0] if output_lines else "",
+        "jobs_wait_result": output_lines[-1] if output_lines else "",
+        "relation": stats,
+    }
+
+
 def relation_sizes(dsn: str, ctx: LayoutContext) -> dict[str, int]:
     if ctx.layout == "clickhouse":
         sql = textwrap.dedent(
@@ -750,7 +932,25 @@ def relation_sizes(dsn: str, ctx: LayoutContext) -> dict[str, int]:
         ) sized;
         """
     )
-    return {key: int(value) for key, value in query_scalar_json(dsn, sql).items()}
+    sizes = {key: int(value) for key, value in query_scalar_json(dsn, sql).items()}
+    if ctx.layout == "alloydb_columnar":
+        columnar_size = query_scalar_int(
+            dsn,
+            textwrap.dedent(
+                f"""
+                SELECT COALESCE((
+                    SELECT size
+                    FROM g_columnar_relations
+                    WHERE schema_name = {sql_literal(ctx.schema)}
+                      AND relation_name = 'events'
+                    LIMIT 1
+                ), 0);
+                """
+            ),
+        )
+        if columnar_size > 0:
+            sizes["columnar_store"] = columnar_size
+    return sizes
 
 
 def build_query_context(rows: int, work_rows: int, ctx: LayoutContext) -> dict[str, str]:
@@ -793,7 +993,18 @@ def run_query_suite(
             query = adapt_query_for_clickhouse(query)
             timings = [clickhouse_query_timing_ms(dsn, query) for _ in range(query_runs)]
         else:
-            timings = [explain_timing_ms(dsn, query) for _ in range(query_runs)]
+            timings = []
+            columnar_plan_runs = 0
+            prelude = (
+                "SET google_columnar_engine.enable_columnar_scan = on;"
+                if ctx.layout == "alloydb_columnar"
+                else ""
+            )
+            for _ in range(query_runs):
+                plan = explain_plan_json(dsn, query, prelude=prelude)
+                timings.append(float(plan[0]["Execution Time"]))
+                if ctx.layout == "alloydb_columnar" and plan_uses_alloydb_columnar(plan):
+                    columnar_plan_runs += 1
         results[name] = {
             "query": query,
             "runs_ms": [round(value, 3) for value in timings],
@@ -801,6 +1012,9 @@ def run_query_suite(
             "min_ms": round(min(timings), 3),
             "max_ms": round(max(timings), 3),
         }
+        if ctx.layout == "alloydb_columnar":
+            results[name]["plan_uses_alloydb_columnar"] = columnar_plan_runs > 0
+            results[name]["columnar_plan_runs"] = columnar_plan_runs
 
     return results
 
@@ -1029,6 +1243,14 @@ def main() -> int:
         targets.append(
             BenchmarkTarget(label=label, layout="clickhouse", dsn=clickhouse_url)
         )
+    for label, alloydb_columnar_dsn in args._alloydb_columnar_targets:
+        targets.append(
+            BenchmarkTarget(
+                label=label,
+                layout="alloydb_columnar",
+                dsn=alloydb_columnar_dsn,
+            )
+        )
 
     report: dict[str, Any] = {
         "config": {
@@ -1039,6 +1261,11 @@ def main() -> int:
             "hydra_layouts": hydra_layouts,
             "compare_targets": [label for label, _ in args._compare_targets],
             "clickhouse_targets": [label for label, _ in args._clickhouse_targets],
+            "alloydb_columnar_targets": [
+                label for label, _ in args._alloydb_columnar_targets
+            ],
+            "alloydb_columnar_columns": args.alloydb_columnar_columns,
+            "alloydb_columnar_wait_ms": args.alloydb_columnar_wait_ms,
             "query_runs": args.query_runs,
             "append_batches": args.append_batches,
             "append_rows": args.append_rows,
@@ -1071,6 +1298,15 @@ def main() -> int:
             )
 
             analyze_seconds = analyze_layout(target.dsn, ctx, rows=args.rows, verbose=args.verbose)
+            target_metadata: dict[str, Any] = {}
+            if target.layout == "alloydb_columnar":
+                target_metadata["alloydb_columnar"] = prepare_alloydb_columnar(
+                    target.dsn,
+                    ctx,
+                    args.alloydb_columnar_columns,
+                    args.alloydb_columnar_wait_ms,
+                    verbose=args.verbose,
+                )
             sizes = relation_sizes(target.dsn, ctx)
             query_results = run_query_suite(
                 target.dsn, ctx, args.rows, args.work_rows, args.query_runs,
@@ -1119,6 +1355,8 @@ def main() -> int:
                 "append": append_result,
                 "update": update_result,
             }
+            if target_metadata:
+                report["layouts"][target.label]["metadata"] = target_metadata
 
     finally:
         if args.cleanup:

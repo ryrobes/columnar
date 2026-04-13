@@ -150,6 +150,13 @@ The `bench/` harness was simplified and updated:
   runs the same synthetic workload against a ClickHouse HTTP endpoint
   using a native `MergeTree` table, and the `Makefile` includes local
   start/stop and smoke/25M benchmark targets.
+- Added AlloyDB Omni columnar-engine benchmark support.
+  `--compare-alloydb-columnar label=dsn` expects an Omni instance started
+  with `google_columnar_engine.enabled=on`, populates the benchmark query
+  columns with `google_columnar_engine_add`, waits for the columnar job,
+  records `g_columnar_relations`, adds `columnar_store` bytes to the size
+  report, and records whether each executed plan used AlloyDB's
+  `columnar scan`.
 
 For reader/storage experiments, `columnar.enable_scan_diagnostics` can be
 enabled for `EXPLAIN ANALYZE`. It is off by default and reports per-scan
@@ -172,6 +179,7 @@ Example:
 make bench_storage BENCH_ARGS="--rows 1000000 --query-runs 3 \
   --compare vanilla18=postgresql://user:pass@host/db \
   --compare alloydb=postgresql://user:pass@alloydb/db \
+  --compare-alloydb-columnar alloydb_columnar=postgresql://user:pass@alloydb-columnar/db \
   --output tmp/bench.json"
 ```
 
@@ -372,6 +380,70 @@ So the honest comparison is: ClickHouse is the read-performance target
 to chase, while this fork is currently strongest when the goal is
 PostgreSQL compatibility, compact storage, and transactional DML inside
 Postgres.
+
+### AlloyDB Omni Columnar Engine
+
+The plain `--compare alloydb=...` target creates a normal Postgres row
+table. That is useful as an Omni row-store baseline, but it does not
+exercise Google's columnar engine unless the server is started with the
+engine enabled and the table is populated into the column store. AlloyDB
+Omni's docs describe those as separate steps:
+[columnar engine overview](https://cloud.google.com/alloydb/omni/docs/columnar-engine/overview)
+and
+[columnar engine configuration](https://docs.cloud.google.com/alloydb/omni/containers/current/docs/columnar-engine/configure).
+
+The harness now has an explicit target for that path:
+
+```bash
+make alloydb_columnar_bench_start
+make bench_storage_alloydb_columnar_smoke
+```
+
+The Docker target starts `google/alloydbomni` with:
+
+```bash
+postgres -c google_columnar_engine.enabled=on \
+  -c google_columnar_engine.memory_size_in_mb=2048
+```
+
+It also sets `--shm-size=2g`; without a larger `/dev/shm`, Omni can warn
+about insufficient dynamic shared memory while generating columnar
+formats inside Docker. The 25M-row target is:
+
+```bash
+make bench_storage_alloydb_columnar_25m
+```
+
+Smoke result from the local 50k-row check:
+
+| metric               | columnar | alloydb | alloydb_columnar |
+|----------------------|---------:|--------:|-----------------:|
+| total_size_mb        | 0.797    | 14.555  | 18.680           |
+| load_seconds         | 0.178    | 0.160   | 0.165            |
+| append_total_seconds | 0.019    | 0.026   | 0.034            |
+| update_seconds       | 0.119    | 0.070   | 0.084            |
+
+| query               | columnar | alloydb | alloydb_columnar |
+|---------------------|---------:|--------:|-----------------:|
+| count_all           | 1.266    | 3.766   | 0.085            |
+| distinct_users      | 4.097    | 5.685   | 0.842            |
+| filtered_count      | 2.424    | 6.685   | 0.201            |
+| hot_work_slice      | 2.967    | 5.392   | 0.383            |
+| latency_rollup      | 3.795    | 7.030   | 0.399            |
+| recent_window       | 5.548    | 10.653  | 0.791            |
+| region_day_rollup   | 9.059    | 10.612  | 1.494            |
+| search_phrase_topn  | 8.194    | 8.503   | 2.998            |
+| service_topn        | 8.281    | 8.615   | 0.877            |
+| tenant_error_rollup | 10.629   | 11.871  | 10.579           |
+| url_like            | 6.377    | 9.074   | 1.317            |
+| wide_sum            | 9.564    | 7.514   | 3.777            |
+
+For that smoke run, `g_columnar_relations` reported `Usable`, all
+1,855 table blocks were in the columnar cache, and all 12 benchmark
+queries had executed plans containing AlloyDB's `columnar scan`. The
+reported `alloydb_columnar` size includes the heap table plus the
+columnar store, so its footprint is expected to be larger than the
+plain row-store target.
 
 ### Upstream Hydra PG14 Comparison
 

@@ -138,6 +138,14 @@ CLICKHOUSE_PASSWORD ?= clickhouse
 CLICKHOUSE_HTTP_PORT ?= 8123
 CLICKHOUSE_TCP_PORT ?= 9000
 CLICKHOUSE_DSN ?= http://$(CLICKHOUSE_USER):$(CLICKHOUSE_PASSWORD)@127.0.0.1:$(CLICKHOUSE_HTTP_PORT)/default
+ALLOYDB_DSN ?= postgresql://postgres:notofox@127.0.0.1:5434/postgres
+ALLOYDB_OMNI_IMAGE ?= google/alloydbomni
+ALLOYDB_COLUMNAR_CONTAINER ?= alloydb-omni-columnar
+ALLOYDB_COLUMNAR_PASSWORD ?= notofox
+ALLOYDB_COLUMNAR_PORT ?= 5444
+ALLOYDB_COLUMNAR_MEMORY_MB ?= 2048
+ALLOYDB_COLUMNAR_SHM_SIZE ?= 2g
+ALLOYDB_COLUMNAR_DSN ?= postgresql://postgres:$(ALLOYDB_COLUMNAR_PASSWORD)@127.0.0.1:$(ALLOYDB_COLUMNAR_PORT)/postgres
 
 .PHONY: bench_storage
 bench_storage:
@@ -177,6 +185,41 @@ bench_storage_clickhouse_25m:
 		--append-batches 5 --append-rows 10000 \
 		--compare-clickhouse clickhouse=$(CLICKHOUSE_DSN) \
 		--output tmp/clickhouse-25m.json \
+		$(BENCH_ARGS)
+
+.PHONY: alloydb_columnar_bench_start
+alloydb_columnar_bench_start:
+	-docker rm -f $(ALLOYDB_COLUMNAR_CONTAINER) >/dev/null 2>&1
+	docker run -d --name $(ALLOYDB_COLUMNAR_CONTAINER) \
+		--shm-size=$(ALLOYDB_COLUMNAR_SHM_SIZE) \
+		-e POSTGRES_PASSWORD=$(ALLOYDB_COLUMNAR_PASSWORD) \
+		-p $(ALLOYDB_COLUMNAR_PORT):5432 \
+		$(ALLOYDB_OMNI_IMAGE) \
+		postgres -c google_columnar_engine.enabled=on \
+			-c google_columnar_engine.memory_size_in_mb=$(ALLOYDB_COLUMNAR_MEMORY_MB)
+
+.PHONY: alloydb_columnar_bench_stop
+alloydb_columnar_bench_stop:
+	docker rm -f $(ALLOYDB_COLUMNAR_CONTAINER)
+
+.PHONY: bench_storage_alloydb_columnar_smoke
+bench_storage_alloydb_columnar_smoke:
+	python3 bench/local_storage_benchmark.py --dsn "$(BENCH_DSN)" \
+		--layouts columnar --rows 50000 --query-runs 1 \
+		--append-batches 1 --append-rows 1000 \
+		--compare alloydb=$(ALLOYDB_DSN) \
+		--compare-alloydb-columnar alloydb_columnar=$(ALLOYDB_COLUMNAR_DSN) \
+		--output tmp/alloydb-columnar-smoke.json \
+		$(BENCH_ARGS)
+
+.PHONY: bench_storage_alloydb_columnar_25m
+bench_storage_alloydb_columnar_25m:
+	python3 bench/local_storage_benchmark.py --dsn "$(BENCH_DSN)" \
+		--layouts columnar --rows 25000000 --query-runs 3 \
+		--append-batches 5 --append-rows 10000 \
+		--compare alloydb=$(ALLOYDB_DSN) \
+		--compare-alloydb-columnar alloydb_columnar=$(ALLOYDB_COLUMNAR_DSN) \
+		--output tmp/alloydb-columnar-25m.json \
 		$(BENCH_ARGS)
 
 VECTOR_BENCH_ARGS ?=
