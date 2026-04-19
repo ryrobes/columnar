@@ -257,6 +257,7 @@ image_pgvectorscale_baseline:
 IMAGE_REPO ?= ryrobes/hydra-columnar-pg18
 IMAGE_TAG  ?= latest
 IMAGE      := $(IMAGE_REPO):$(IMAGE_TAG)
+COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD ?= columnar
 
 .PHONY: image_build
 # Build the standalone distribution image.
@@ -285,7 +286,7 @@ image_run:
 		-e POSTGRES_USER=postgres \
 		-e POSTGRES_PASSWORD=postgres \
 		-e POSTGRES_DB=postgres \
-		-e COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD=columnar \
+		-e COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD=$(COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD) \
 		-v columnar_pg18_data:/var/lib/postgresql \
 		$(IMAGE)
 

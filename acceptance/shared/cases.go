@@ -69,6 +69,45 @@ SELECT count(1) FROM pg_extension WHERE extname = 'columnar';
 			},
 		},
 		{
+			Name: "default table access method is columnar",
+			SQL:  `SHOW default_table_access_method;`,
+			Validate: func(t *testing.T, row pgx.Row) {
+				var setting string
+				if err := row.Scan(&setting); err != nil {
+					t.Fatal(err)
+				}
+
+				if want, got := "columnar", setting; want != got {
+					t.Errorf("default_table_access_method should match: want=%s, got=%s", want, got)
+				}
+			},
+		},
+		{
+			Name: "create table defaults to columnar",
+			SQL: `
+CREATE TABLE default_columnar_table (i INT);
+			`,
+		},
+		{
+			Name: "created default table is columnar",
+			SQL: `
+SELECT count(1)
+FROM pg_class
+WHERE relname = 'default_columnar_table'
+  AND relam = (SELECT oid FROM pg_am WHERE amname = 'columnar');
+			`,
+			Validate: func(t *testing.T, row pgx.Row) {
+				var count int
+				if err := row.Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+
+				if want, got := 1, count; want != got {
+					t.Errorf("default CREATE TABLE should use columnar access method")
+				}
+			},
+		},
+		{
 			Name: "using a columnar table",
 			SQL: `
 CREATE TABLE my_columnar_table
@@ -84,7 +123,7 @@ CREATE TABLE my_columnar_table
 		{
 			Name: "convert between row and columnar",
 			SQL: `
-		CREATE TABLE my_table(i INT8 DEFAULT '7');
+		CREATE TABLE my_table(i INT8 DEFAULT '7') USING heap;
 		INSERT INTO my_table VALUES(1);
 		-- convert to columnar
 		SELECT columnar.alter_table_set_access_method('my_table', 'columnar');
@@ -95,7 +134,7 @@ CREATE TABLE my_columnar_table
 		{
 			Name: "convert by copying",
 			SQL: `
-CREATE TABLE table_heap (i INT8);
+CREATE TABLE table_heap (i INT8) USING heap;
 CREATE TABLE table_columnar (LIKE table_heap) USING columnar;
 INSERT INTO table_columnar SELECT * FROM table_heap;
 			`,
@@ -116,7 +155,8 @@ CREATE TABLE p1 PARTITION OF parent
   USING COLUMNAR;
 -- row partition
 CREATE TABLE p2 PARTITION OF parent
-  FOR VALUES FROM ('2020-03-01') TO ('2020-04-01');
+  FOR VALUES FROM ('2020-03-01') TO ('2020-04-01')
+  USING heap;
 
 INSERT INTO parent VALUES ('2020-01-15', 10, 100, 'one thousand'); -- columnar
 INSERT INTO parent VALUES ('2020-02-15', 20, 200, 'two thousand'); -- columnar
@@ -436,7 +476,7 @@ SELECT count(1) FROM pg_extension WHERE extname = 'vector';
 		{
 			Name: "create pg_vector column",
 			SQL: `
-CREATE TABLE items (id bigserial PRIMARY KEY, embedding vector(3));
+CREATE TABLE items (id bigserial PRIMARY KEY, embedding vector(3)) USING heap;
 		`,
 		},
 		{

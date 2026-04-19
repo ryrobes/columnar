@@ -217,7 +217,6 @@ docker run -d --name columnar-pg18 \
   -e POSTGRES_USER=postgres \
   -e POSTGRES_PASSWORD=postgres \
   -e POSTGRES_DB=postgres \
-  -e COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD=columnar \
   -v columnar_pg18_data:/var/lib/postgresql \
   ryrobes/hydra-columnar-pg18:latest
 
@@ -225,8 +224,17 @@ psql postgresql://postgres:postgres@127.0.0.1:5432/postgres
 ```
 
 By default, `CREATE TABLE foo(...)` creates a columnar table. Use
-`USING heap` for row-store tables. `CREATE EXTENSION vector` is also
-already installed.
+`USING heap` for row-store tables, or set
+`COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD=heap` before first startup to make
+heap the database default. `CREATE EXTENSION vector` is also already
+installed. The image creates both `columnar` and `vector` in the initial
+databases and in `template1`, so databases created later from the normal
+template inherit both extensions.
+
+Postgres only runs `/docker-entrypoint-initdb.d` scripts for a new data
+directory. For an existing volume/database created before this image
+behavior, run `CREATE EXTENSION IF NOT EXISTS columnar;` in that
+database and set `default_table_access_method` manually.
 
 ### 📦 Build & Publish Your Own Image
 
@@ -262,7 +270,9 @@ The resulting image is ~500 MB, self-contained, and includes:
 - columnar extension (this fork)
 - pgvector 0.8.2
 - auto-init: creates both extensions and sets
-  `default_table_access_method = columnar` on first startup
+  `default_table_access_method = columnar` on first startup unless
+  `COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD=heap` is set. The extensions are
+  also seeded into `template1` for future databases.
 
 ## 💪 Benchmark Results
 
@@ -554,10 +564,11 @@ build with pgvector included, and a better benchmark harness.
 
 ### Q: Can columnar be the default table type?
 
-A: Yes. The `docker-compose.pg18.yml` sets
+A: Yes. The image init scripts default to
 `default_table_access_method = columnar`, so `CREATE TABLE` creates
 columnar tables by default. Use `USING heap` to opt into row storage
-for OLTP tables.
+for OLTP tables, or set `COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD=heap`
+before first startup to change the database default.
 
 ### Q: What Postgres features are unsupported on columnar?
 

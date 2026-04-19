@@ -10,7 +10,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
-      COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD: columnar
+      COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD: ${COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD:-columnar}
     volumes:
       - columnar_pg18_data:/var/lib/postgresql
 

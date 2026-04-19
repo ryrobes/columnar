@@ -80,12 +80,11 @@ CREATE TABLE my_columnar_table
 Insert data into the table and read from it like normal (subject to
 the limitations listed above).
 
-The sample Docker image in this repository now defaults
-`default_table_access_method` to `heap`, so columnar stays opt-in. To
-make all new tables columnar in a database, set
-`default_table_access_method = 'columnar'` explicitly or set
-`COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD=columnar` when initializing the
-container.
+The sample Docker image in this repository defaults
+`default_table_access_method` to `columnar`, so new tables use columnar
+storage unless they specify otherwise. Use `USING heap` on a table, or
+set `COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD=heap` when initializing the
+container, to opt into row storage by default.
 
 To see internal statistics about the table, use ``VACUUM
 VERBOSE``. Note that ``VACUUM`` (without ``FULL``) is much faster on a

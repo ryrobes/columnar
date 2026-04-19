@@ -4,6 +4,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
 export PGOPTIONS="-c synchronous_commit=local -c search_path=pg_catalog"
 
+DEFAULT_TABLE_ACCESS_METHOD="${COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD:-columnar}"
+case "${DEFAULT_TABLE_ACCESS_METHOD}" in
+  heap|columnar)
+    ;;
+  *)
+    echo "COLUMNAR_DEFAULT_TABLE_ACCESS_METHOD must be 'heap' or 'columnar'" >&2
+    exit 1
+    ;;
+esac
+
 PGVER=$(psql -d "$2" -XtAc "SELECT pg_catalog.current_setting('server_version_num')::int/10000")
 if [ "$PGVER" -ge 12 ]; then RESET_ARGS="oid, oid, bigint"; fi
 
@@ -194,6 +204,7 @@ UPDATE pg_catalog.pg_extension SET extname = 'columnar' WHERE extname = 'citus_c
 UPDATE pg_catalog.pg_proc SET probin = '\$libdir/columnar' WHERE probin = '\$libdir/citus_columnar';
 CREATE EXTENSION IF NOT EXISTS columnar;
 ALTER EXTENSION columnar UPDATE;
+ALTER DATABASE ${db_name} SET default_table_access_method = '${DEFAULT_TABLE_ACCESS_METHOD}';
 GRANT EXECUTE ON FUNCTION public.set_user(text) TO admin;
 GRANT EXECUTE ON FUNCTION public.pg_stat_statements_reset($RESET_ARGS) TO admin;"
     if [ "$PGVER" -lt 10 ]; then
